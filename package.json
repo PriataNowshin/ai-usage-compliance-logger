@@ -1,6 +1,6 @@
 {
-  "name": "ai-policy",
-  "displayName": "ai-policy",
+  "name": "ai-usage-compliance-logger",
+  "displayName": "AI Usage Compliance Logger",
   "description": "",
   "version": "0.0.1",
   "engines": {
@@ -10,16 +10,11 @@
     "Other"
   ],
   "activationEvents": [
-    "onCommand:ai-policy.aiPolicy"
+        "onLanguage:python"
   ],
   "main": "./out/extension.js",
   "contributes": {
-    "commands": [
-      {
-        "command": "ai-policy.aiPolicy",
-        "title": "AI Policy"
-      }
-    ]
+    "commands": []
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
