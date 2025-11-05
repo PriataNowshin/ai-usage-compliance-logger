@@ -12,46 +12,8 @@ const recentInsertions: TextInsertion[] = [];
 const INSERTION_WINDOW_MS = 60000; // Track insertions within last 60 seconds
 
 export function activate(context: vscode.ExtensionContext) {
-    setupManualCommand(context);
     setupFileSaveListener(context);
     setupInsertionTracking(context);
-}
-
-export function deactivate() {}
-
-function setupManualCommand(context: vscode.ExtensionContext) {
-    const disposable = vscode.commands.registerCommand('ai-policy.aiPolicy', async () => {
-        const editor = vscode.window.activeTextEditor;
-        
-        if (!editor) {
-            vscode.window.showWarningMessage('No file is currently open! Please open a Python file first.');
-            return;
-        }
-
-        const document = editor.document;
-
-        if (document.languageId !== 'python') {
-            vscode.window.showWarningMessage(
-                `Current file is not a Python file!\n` +
-                `File type: ${document.languageId}\n` +
-                `Please open a Python (.py) file to check changes.`
-            );
-            return;
-        }
-
-        if (document.isDirty) {
-            vscode.window.showWarningMessage(
-                'File has unsaved changes!\n' +
-                'Please save the file first (Ctrl+S) before checking changes.'
-            );
-            return;
-        }
-
-        await checkChangesAgainstGit(document);
-        await checkChangesAgainstCopilot(document);
-    });
-
-    context.subscriptions.push(disposable);
 }
 
 function setupFileSaveListener(context: vscode.ExtensionContext) {
@@ -314,7 +276,6 @@ async function checkChangesAgainstGit(document: vscode.TextDocument) {
         const differences = calculateDetailedDifferences(oldContent, newContent);
 
         printDifferencesToConsole(differences, document);
-        await displayChanges(document, differences);
 
     } catch (error) {
         console.error('Error:', error);
@@ -438,15 +399,4 @@ function printDifferencesToConsole(differences: any, document: vscode.TextDocume
     }
 
     console.log('\n' + '='.repeat(80) + '\n');
-}
-
-async function displayChanges(document: vscode.TextDocument, differences: any) {
-    const fileName = document.fileName.split('/').pop() || document.fileName;
-    const stats = differences.statistics;
-
-    const summaryMessage = 
-        `Changes in "${fileName}"\n` +
-        `+${stats.linesAdded} -${stats.linesRemoved} ~${stats.linesModified}`;
-
-    vscode.window.showInformationMessage(summaryMessage);
 }
