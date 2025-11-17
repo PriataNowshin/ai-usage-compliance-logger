@@ -1038,7 +1038,7 @@ export class ChatbotPanel {
                     }
                 });
 
-                // Also check if the content matches a portion of the entire code block
+                // Also check if the content matches a portion within the code blocks
                 const fullCodeBlock = codeBlocks.map(b => b.code).join('\n\n');
                 const partialMatches = this.findPartialCodeMatches(content, fullCodeBlock);
                 
@@ -1085,7 +1085,6 @@ export class ChatbotPanel {
         matchedPortion: string;
     }> {
         const matches: Array<{ similarity: number; matchedPortion: string }> = [];
-        const normalize = (str: string) => str.replace(/\s+/g, ' ').trim().toLowerCase();
         
         // Split the full code into functions/classes/blocks
         const codeSegments = this.splitCodeIntoSegments(fullCode);
@@ -1108,59 +1107,83 @@ export class ChatbotPanel {
         const lines = code.split('\n');
         
         let currentSegment: string[] = [];
-        let inFunction = false;
-        let indentLevel = 0;
+        let inBlock = false;
+        let baseIndent = 0;
         
         for (let i = 0; i < lines.length; i++) {
             const line = lines[i];
             const trimmedLine = line.trim();
+            const currentIndent = line.length - line.trimStart().length;
             
-            // Detect function/class definition
-            if (trimmedLine.startsWith('def ') || 
+            // Skip empty lines when not in a block
+            if (trimmedLine.length === 0 && !inBlock) {
+                continue;
+            }
+            
+            // Detect function/class/block definition
+            const isBlockStart = 
+                trimmedLine.startsWith('def ') || 
                 trimmedLine.startsWith('class ') ||
                 trimmedLine.startsWith('function ') ||
-                trimmedLine.startsWith('const ') ||
-                trimmedLine.startsWith('let ') ||
-                trimmedLine.startsWith('var ')) {
-                
+                trimmedLine.startsWith('const ') && (trimmedLine.includes('= function') || trimmedLine.includes('=> ')) ||
+                trimmedLine.startsWith('let ') && (trimmedLine.includes('= function') || trimmedLine.includes('=> ')) ||
+                trimmedLine.startsWith('var ') && (trimmedLine.includes('= function') || trimmedLine.includes('=> ')) ||
+                trimmedLine.startsWith('async ') ||
+                trimmedLine.startsWith('export function') ||
+                trimmedLine.startsWith('export const') && (trimmedLine.includes('= function') || trimmedLine.includes('=> '));
+            
+            if (isBlockStart) {
                 // Save previous segment if exists
                 if (currentSegment.length > 0) {
-                    segments.push(currentSegment.join('\n'));
+                    segments.push(currentSegment.join('\n').trim());
                 }
                 
                 // Start new segment
                 currentSegment = [line];
-                inFunction = true;
-                indentLevel = line.length - line.trimStart().length;
-            } else if (inFunction) {
-                currentSegment.push(line);
+                inBlock = true;
+                baseIndent = currentIndent;
+            } else if (inBlock) {
+                // Check if this line is at base indent or less and is actual code (not empty/comment)
+                const isCodeAtBaseIndent = trimmedLine.length > 0 && 
+                                          currentIndent <= baseIndent && 
+                                          !trimmedLine.startsWith('#') &&
+                                          !trimmedLine.startsWith('//') &&
+                                          !trimmedLine.startsWith('"""') &&
+                                          !trimmedLine.startsWith("'''");
                 
-                // Check if function/block ended (back to original indent or less)
-                const currentIndent = line.length - line.trimStart().length;
-                if (trimmedLine.length > 0 && currentIndent <= indentLevel && i < lines.length - 1) {
-                    const nextLine = lines[i + 1];
-                    const nextTrimmed = nextLine.trim();
-                    if (nextTrimmed.startsWith('def ') || 
-                        nextTrimmed.startsWith('class ') ||
-                        nextTrimmed.startsWith('function ') ||
-                        nextTrimmed === '') {
-                        // Function ended
-                        segments.push(currentSegment.join('\n'));
-                        currentSegment = [];
-                        inFunction = false;
+                if (isCodeAtBaseIndent && currentSegment.length > 1) {
+                    // This line is at base indent and is code, so previous block has ended
+                    segments.push(currentSegment.join('\n').trim());
+                    currentSegment = [];
+                    inBlock = false;
+                    
+                    // Don't add this line, it belongs to next segment or standalone
+                    if (isBlockStart) {
+                        currentSegment = [line];
+                        inBlock = true;
+                        baseIndent = currentIndent;
+                    } else if (trimmedLine.length > 0) {
+                        segments.push(line.trim());
                     }
+                } else {
+                    // Still part of current block
+                    currentSegment.push(line);
                 }
             } else {
-                currentSegment.push(line);
+                // Not in a block, treat as standalone segment or start of new block
+                if (trimmedLine.length > 0) {
+                    segments.push(line.trim());
+                }
             }
         }
         
-        // Add last segment
+        // Add last segment if exists
         if (currentSegment.length > 0) {
-            segments.push(currentSegment.join('\n'));
+            segments.push(currentSegment.join('\n').trim());
         }
         
-        return segments.filter(s => s.trim().length > 0);
+        // Filter out very short segments (likely comments or single lines)
+        return segments.filter(s => s.trim().length > 10);
     }
 
     private deduplicateMatches(matches: Array<{
@@ -1189,6 +1212,7 @@ export class ChatbotPanel {
                     representative.matchedPortion
                 );
                 
+                // If they're very similar, group them together
                 if (similarity > 0.9) {
                     group.push(match);
                     addedToGroup = true;
@@ -1201,10 +1225,256 @@ export class ChatbotPanel {
             }
         });
 
-        // From each group, keep only the best match
+        // From each group, keep only the best match (highest similarity)
         return groups.map(group => {
             return group.reduce((best, current) => {
                 return current.similarity > best.similarity ? current : best;
             });
         });
     }
+
+    private calculateSimilarity(str1: string, str2: string): number {
+        // Normalize strings: remove whitespace, convert to lowercase
+        const normalize = (str: string) => str
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLowerCase();
+
+        const normalized1 = normalize(str1);
+        const normalized2 = normalize(str2);
+
+        // If strings are very short, require exact match
+        if (normalized1.length < 20 || normalized2.length < 20) {
+            return normalized1 === normalized2 ? 1.0 : 0.0;
+        }
+
+        // **NEW: Check if str1 is a subset of str2 (file code ⊆ chatbot code)**
+        // This handles cases where user removed parts of AI-generated code
+        if (this.isSubsetMatch(normalized1, normalized2)) {
+            return 1.0; // 100% - file code is entirely from chatbot
+        }
+
+        if (this.isSubsetMatch(normalized2, normalized1)) {
+            return 1.0; // 100% - chatbot code is entirely in file
+        }
+
+        // **NEW: Check for structural similarity (ignoring variable names)**
+        const structuralSimilarity = this.calculateStructuralSimilarity(str1, str2);
+        if (structuralSimilarity > 0.9) {
+            return structuralSimilarity;
+        }
+
+        // Check for substring containment
+        const longerLength = Math.max(normalized1.length, normalized2.length);
+        const shorterLength = Math.min(normalized1.length, normalized2.length);
+
+        if (normalized1.includes(normalized2)) {
+            return shorterLength / longerLength;
+        }
+        
+        if (normalized2.includes(normalized1)) {
+            return shorterLength / longerLength;
+        }
+
+        // Calculate Levenshtein distance-based similarity for similar-length strings
+        if (Math.abs(normalized1.length - normalized2.length) / longerLength < 0.5) {
+            const distance = this.levenshteinDistance(normalized1, normalized2);
+            const maxLength = Math.max(normalized1.length, normalized2.length);
+            return maxLength === 0 ? 1 : 1 - (distance / maxLength);
+        }
+
+        // For very different lengths, check overlap
+        return this.calculateOverlapSimilarity(normalized1, normalized2);
+    }
+
+    /**
+     * Check if str1 is a subset of str2 by comparing all significant lines
+     * This handles cases where user removed comments/docstrings from AI code
+     */
+    private isSubsetMatch(str1: string, str2: string): boolean {
+        // Extract significant lines (ignore comments, docstrings, empty lines)
+        const getSignificantLines = (text: string): string[] => {
+            return text
+                .split(/\n/)
+                .map(line => line.trim())
+                .filter(line => {
+                    // Keep only actual code lines
+                    return line.length > 0 &&
+                           !line.startsWith('#') &&
+                           !line.startsWith('//') &&
+                           !line.startsWith('"""') &&
+                           !line.startsWith("'''") &&
+                           line !== '"""' &&
+                           line !== "'''";
+                })
+                .map(line => line.replace(/\s+/g, ' ').toLowerCase());
+        };
+
+        const lines1 = getSignificantLines(str1);
+        const lines2 = getSignificantLines(str2);
+
+        if (lines1.length === 0 || lines2.length === 0) {
+            return false;
+        }
+
+        // Check if all lines from str1 exist in str2 (in any order)
+        let matchedLines = 0;
+        for (const line1 of lines1) {
+            for (const line2 of lines2) {
+                // Allow fuzzy match (handles minor spacing differences)
+                if (line2.includes(line1) || line1.includes(line2)) {
+                    matchedLines++;
+                    break;
+                }
+            }
+        }
+
+        // If 90%+ of lines match, consider it a subset
+        return (matchedLines / lines1.length) >= 0.9;
+    }
+
+    /**
+     * Calculate structural similarity ignoring variable/parameter names
+     * This handles cases where user renamed variables
+     */
+    private calculateStructuralSimilarity(str1: string, str2: string): number {
+        // Extract structure by removing identifiers
+        const getStructure = (code: string): string => {
+            return code
+                // Remove string literals
+                .replace(/"[^"]*"/g, '""')
+                .replace(/'[^']*'/g, "''")
+                // Replace identifiers with placeholder (but keep keywords)
+                .replace(/\b(?!def|class|if|else|elif|for|while|return|import|from|as|with|try|except|finally|pass|break|continue|function|const|let|var|async|await)\w+\b/g, 'ID')
+                // Normalize whitespace
+                .replace(/\s+/g, ' ')
+                .trim()
+                .toLowerCase();
+        };
+
+        const struct1 = getStructure(str1);
+        const struct2 = getStructure(str2);
+
+        // Check if structures match
+        if (struct1 === struct2) {
+            return 1.0;
+        }
+
+        // Calculate similarity of structures
+        if (struct1.includes(struct2) || struct2.includes(struct1)) {
+            const shorterLength = Math.min(struct1.length, struct2.length);
+            const longerLength = Math.max(struct1.length, struct2.length);
+            return shorterLength / longerLength;
+        }
+
+        // Use Levenshtein distance on structures
+        const distance = this.levenshteinDistance(struct1, struct2);
+        const maxLength = Math.max(struct1.length, struct2.length);
+        return maxLength === 0 ? 1 : 1 - (distance / maxLength);
+    }
+
+    private levenshteinDistance(str1: string, str2: string): number {
+        // Optimize for large strings
+        if (Math.abs(str1.length - str2.length) > 1000) {
+            return Math.max(str1.length, str2.length);
+        }
+
+        const matrix: number[][] = [];
+
+        for (let i = 0; i <= str2.length; i++) {
+            matrix[i] = [i];
+        }
+
+        for (let j = 0; j <= str1.length; j++) {
+            matrix[0][j] = j;
+        }
+
+        for (let i = 1; i <= str2.length; i++) {
+            for (let j = 1; j <= str1.length; j++) {
+                if (str2.charAt(i - 1) === str1.charAt(j - 1)) {
+                    matrix[i][j] = matrix[i - 1][j - 1];
+                } else {
+                    matrix[i][j] = Math.min(
+                        matrix[i - 1][j - 1] + 1, // substitution
+                        matrix[i][j - 1] + 1,     // insertion
+                        matrix[i - 1][j] + 1      // deletion
+                    );
+                }
+            }
+        }
+
+        return matrix[str2.length][str1.length];
+    }
+
+    private calculateOverlapSimilarity(str1: string, str2: string): number {
+        const words1 = str1.split(/\s+/);
+        const words2 = str2.split(/\s+/);
+        
+        const set1 = new Set(words1);
+        const set2 = new Set(words2);
+        
+        let commonWords = 0;
+        set1.forEach(word => {
+            if (set2.has(word)) {
+                commonWords++;
+            }
+        });
+        
+        const totalUniqueWords = Math.max(set1.size, set2.size);
+        return commonWords / totalUniqueWords;
+    }
+
+    private findBestMatchingSubstring(content: string, text: string): string {
+        const normalize = (str: string) => str.replace(/\s+/g, ' ').trim().toLowerCase();
+        const normalizedContent = normalize(content);
+        const normalizedText = normalize(text);
+
+        // Split text into sentences or paragraphs
+        const sentences = text.split(/[.!?\n]+/).filter(s => s.trim().length > 10);
+        
+        let bestMatch = '';
+        let bestSimilarity = 0;
+
+        // Find the sentence/paragraph with highest similarity
+        sentences.forEach(sentence => {
+            const similarity = this.calculateSimilarity(content, sentence);
+            if (similarity > bestSimilarity) {
+                bestSimilarity = similarity;
+                bestMatch = sentence.trim();
+            }
+        });
+
+        // If we found a good match, return it with context
+        if (bestMatch && bestMatch.length > 0) {
+            return bestMatch.length > 300 ? bestMatch.substring(0, 300) + '...' : bestMatch;
+        }
+
+        // Fallback: try to find direct substring match
+        if (normalizedText.includes(normalizedContent)) {
+            const startIndex = normalizedText.indexOf(normalizedContent);
+            const originalStartIndex = this.findOriginalIndex(text, normalizedText, startIndex);
+            const matchLength = content.length;
+            return text.substring(originalStartIndex, originalStartIndex + matchLength + 50) + '...';
+        }
+
+        return text.substring(0, 300) + '...';
+    }
+
+    private findOriginalIndex(original: string, normalized: string, normalizedIndex: number): number {
+        let originalIndex = 0;
+        let currentNormalizedIndex = 0;
+        
+        for (let i = 0; i < original.length && currentNormalizedIndex < normalizedIndex; i++) {
+            if (!original[i].match(/\s/)) {
+                currentNormalizedIndex++;
+            }
+            originalIndex++;
+        }
+        
+        return originalIndex;
+    }
+
+    public static getCurrentPanel(): ChatbotPanel | undefined {
+        return ChatbotPanel.currentPanel;
+    }
+}

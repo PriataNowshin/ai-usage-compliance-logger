@@ -58,80 +58,213 @@ export class GitChangeTracker {
             return;
         }
 
-        // Check added lines
+        let highestSimilarity = 0;
+        let bestMatch: any = null;
+        let matchType = '';
+        let matchedContent = '';
+
+        // Extract code segments from added lines
         if (differences.added.length > 0) {
             const addedContent = differences.added.map((line: any) => line.content).join('\n');
-            const aiCheck = chatbot.checkAIGeneratedContent(addedContent);
-
-            if (aiCheck.isAIGenerated) {
-                // Get only the highest similarity match
-                const bestMatch = aiCheck.matchedMessages[0]; // Already sorted by similarity in descending order
-
-                console.log('\n' + '⚠'.repeat(40));
-                console.log('AI-GENERATED CONTENT DETECTED IN ADDED LINES');
-                console.log('⚠'.repeat(40));
-                console.log(`Maximum Similarity: ${(bestMatch.similarity * 100).toFixed(2)}%`);
-                console.log(`\nBest Match:`);
-                console.log(`  From conversation: "${bestMatch.assistantMessage}"`);
-                console.log('⚠'.repeat(40) + '\n');
-
-                // Show VS Code notification
-                const action = await vscode.window.showWarningMessage(
-                    `AI-generated content detected (${(bestMatch.similarity * 100).toFixed(0)}% match)`,
-                    'View Details',
-                    'Ignore'
-                );
-
-                if (action === 'View Details') {
-                    this.showAIDetectionReport(differences, aiCheck, document);
+            const codeSegments = this.extractCodeSegmentsFromChanges(addedContent);
+            
+            // Check each segment individually
+            for (const segment of codeSegments) {
+                const aiCheck = chatbot.checkAIGeneratedContent(segment);
+                
+                if (aiCheck.isAIGenerated && aiCheck.matchedMessages.length > 0) {
+                    const topMatch = aiCheck.matchedMessages[0];
+                    if (topMatch.similarity > highestSimilarity) {
+                        highestSimilarity = topMatch.similarity;
+                        bestMatch = topMatch;
+                        matchType = 'ADDED';
+                        matchedContent = segment;
+                    }
+                }
+            }
+            
+            // If no segments found or low similarity, check the entire added content
+            if (highestSimilarity < 0.8) {
+                const aiCheck = chatbot.checkAIGeneratedContent(addedContent);
+                if (aiCheck.isAIGenerated && aiCheck.matchedMessages.length > 0) {
+                    const topMatch = aiCheck.matchedMessages[0];
+                    if (topMatch.similarity > highestSimilarity) {
+                        highestSimilarity = topMatch.similarity;
+                        bestMatch = topMatch;
+                        matchType = 'ADDED';
+                        matchedContent = addedContent;
+                    }
                 }
             }
         }
 
-        // Check modified lines
+        // Extract code segments from modified lines
         if (differences.modified.length > 0) {
             const modifiedContent = differences.modified.map((line: any) => line.newContent).join('\n');
-            const aiCheck = chatbot.checkAIGeneratedContent(modifiedContent);
+            const codeSegments = this.extractCodeSegmentsFromChanges(modifiedContent);
+            
+            // Check each segment individually
+            for (const segment of codeSegments) {
+                const aiCheck = chatbot.checkAIGeneratedContent(segment);
+                
+                if (aiCheck.isAIGenerated && aiCheck.matchedMessages.length > 0) {
+                    const topMatch = aiCheck.matchedMessages[0];
+                    if (topMatch.similarity > highestSimilarity) {
+                        highestSimilarity = topMatch.similarity;
+                        bestMatch = topMatch;
+                        matchType = 'MODIFIED';
+                        matchedContent = segment;
+                    }
+                }
+            }
+            
+            // If no segments found or low similarity, check the entire modified content
+            if (highestSimilarity < 0.8) {
+                const aiCheck = chatbot.checkAIGeneratedContent(modifiedContent);
+                if (aiCheck.isAIGenerated && aiCheck.matchedMessages.length > 0) {
+                    const topMatch = aiCheck.matchedMessages[0];
+                    if (topMatch.similarity > highestSimilarity) {
+                        highestSimilarity = topMatch.similarity;
+                        bestMatch = topMatch;
+                        matchType = 'MODIFIED';
+                        matchedContent = modifiedContent;
+                    }
+                }
+            }
+        }
 
-            if (aiCheck.isAIGenerated) {
-                // Get only the highest similarity match
-                const bestMatch = aiCheck.matchedMessages[0];
+        // Log only if we found a match
+        if (bestMatch && highestSimilarity > 0.7) {
+            console.log('\n' + '⚠'.repeat(80));
+            console.log(`AI-GENERATED CONTENT DETECTED IN ${matchType} LINES`);
+            console.log('⚠'.repeat(80));
+            console.log(`Maximum Similarity: ${(highestSimilarity * 100).toFixed(2)}%`);
+            console.log(`\nChanged Code Segment:`);
+            console.log('-'.repeat(80));
+            console.log(matchedContent.substring(0, 500)); // Show first 500 chars
+            console.log('-'.repeat(80));
+            console.log(`\nMatched Content from Chatbot:`);
+            console.log('-'.repeat(80));
+            console.log(bestMatch.matchedPortion.substring(0, 500)); // Show first 500 chars
+            console.log('-'.repeat(80));
+            console.log('⚠'.repeat(80) + '\n');
 
-                console.log('\n' + '⚠'.repeat(40));
-                console.log('AI-GENERATED CONTENT DETECTED IN MODIFIED LINES');
-                console.log('⚠'.repeat(40));
-                console.log(`Maximum Similarity: ${(bestMatch.similarity * 100).toFixed(2)}%`);
-                console.log(`\nBest Match:`);
-                console.log(`  From conversation: "${bestMatch.assistantMessage}"`);
-                console.log('⚠'.repeat(40) + '\n');
+            // Show VS Code notification
+            const action = await vscode.window.showWarningMessage(
+                `AI-generated content detected (${(highestSimilarity * 100).toFixed(0)}% match)`,
+                'View Details',
+                'Ignore'
+            );
+
+            if (action === 'View Details') {
+                await this.showDetailedAIReport(matchedContent, bestMatch, highestSimilarity, matchType, document);
             }
         }
     }
 
-    private async showAIDetectionReport(differences: any, aiCheck: any, document: vscode.TextDocument): Promise<void> {
+    private extractCodeSegmentsFromChanges(content: string): string[] {
+        const segments: string[] = [];
+        const lines = content.split('\n');
+        
+        let currentSegment: string[] = [];
+        let inBlock = false;
+        let baseIndent = 0;
+        
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            const trimmedLine = line.trim();
+            const currentIndent = line.length - line.trimStart().length;
+            
+            if (trimmedLine.length === 0 && !inBlock) {
+                continue;
+            }
+            
+            // Detect function/class/block definition
+            const isBlockStart = 
+                trimmedLine.startsWith('def ') || 
+                trimmedLine.startsWith('class ') ||
+                trimmedLine.startsWith('function ') ||
+                trimmedLine.startsWith('const ') && (trimmedLine.includes('= function') || trimmedLine.includes('=> ')) ||
+                trimmedLine.startsWith('let ') && (trimmedLine.includes('= function') || trimmedLine.includes('=> ')) ||
+                trimmedLine.startsWith('async ') ||
+                trimmedLine.startsWith('export ');
+            
+            if (isBlockStart) {
+                if (currentSegment.length > 0) {
+                    segments.push(currentSegment.join('\n').trim());
+                }
+                
+                currentSegment = [line];
+                inBlock = true;
+                baseIndent = currentIndent;
+            } else if (inBlock) {
+                currentSegment.push(line);
+                
+                if (trimmedLine.length > 0 && currentIndent <= baseIndent && i > 0) {
+                    const nextLine = i < lines.length - 1 ? lines[i + 1] : '';
+                    const nextTrimmed = nextLine.trim();
+                    
+                    if (nextTrimmed.length === 0 || 
+                        nextTrimmed.startsWith('def ') ||
+                        nextTrimmed.startsWith('class ') ||
+                        nextTrimmed.startsWith('function ') ||
+                        i === lines.length - 1) {
+                        segments.push(currentSegment.join('\n').trim());
+                        currentSegment = [];
+                        inBlock = false;
+                    }
+                }
+            } else {
+                if (trimmedLine.length > 0) {
+                    currentSegment.push(line);
+                }
+            }
+        }
+        
+        if (currentSegment.length > 0) {
+            segments.push(currentSegment.join('\n').trim());
+        }
+        
+        return segments.filter(s => s.trim().length > 20);
+    }
+
+    private async showDetailedAIReport(
+        changedContent: string,
+        bestMatch: any, 
+        similarity: number, 
+        matchType: string, 
+        document: vscode.TextDocument
+    ): Promise<void> {
         const report = `# AI Content Detection Report
 
 **File:** ${document.fileName}
+**Match Type:** ${matchType} Lines
+**Similarity:** ${(similarity * 100).toFixed(2)}%
 
-## Summary
-- **Overall Similarity:** ${(aiCheck.overallSimilarity * 100).toFixed(2)}%
-- **Matches Found:** ${aiCheck.matchedMessages.length}
-- **Lines Added:** ${differences.statistics.linesAdded}
-- **Lines Modified:** ${differences.statistics.linesModified}
+---
 
-## Matches
+## Changed Code in File
 
-${aiCheck.matchedMessages.map((match: any, index: number) => `
-### Match ${index + 1}
-- **Similarity:** ${(match.similarity * 100).toFixed(2)}%
-- **From Conversation:** 
-  \`\`\`
-  ${match.assistantMessage}
-  \`\`\`
-`).join('\n')}
+\`\`\`${document.languageId}
+${changedContent}
+\`\`\`
 
-## Added Lines
-${differences.added.map((line: any) => `Line ${line.lineNumber}: ${line.content}`).join('\n')}
+---
+
+## Matched Content from Chatbot
+
+\`\`\`
+${bestMatch.matchedPortion}
+\`\`\`
+
+---
+
+## Analysis
+
+- **Similarity Score:** ${(similarity * 100).toFixed(2)}%
+- **Match Quality:** ${similarity > 0.95 ? 'Exact Match' : similarity > 0.85 ? 'Very High' : 'High'}
+
+${similarity > 0.95 ? '⚠️ **Warning:** This appears to be an exact or near-exact copy from the AI assistant.' : ''}
 `;
 
         const doc = await vscode.workspace.openTextDocument({
