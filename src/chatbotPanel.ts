@@ -998,4 +998,213 @@ export class ChatbotPanel {
             }
         }
     }
-}
+
+    public checkAIGeneratedContent(content: string): {
+        isAIGenerated: boolean;
+        matchedMessages: Array<{
+            assistantMessage: string;
+            similarity: number;
+            matchedPortion: string;
+        }>;
+        overallSimilarity: number;
+    } {
+        const matches: Array<{
+            assistantMessage: string;
+            similarity: number;
+            matchedPortion: string;
+        }> = [];
+
+        // Get all assistant messages from conversation history
+        const assistantMessages = this.conversationHistory
+            .filter(msg => msg.role === 'assistant')
+            .map(msg => msg.content);
+
+        // Check each assistant message for similarity
+        assistantMessages.forEach(assistantMsg => {
+            // Extract code blocks from assistant message
+            const codeBlocks = this.extractCodeBlocks(assistantMsg);
+            
+            if (codeBlocks.length > 0) {
+                // Check against each code block individually
+                codeBlocks.forEach(block => {
+                    const similarity = this.calculateSimilarity(content, block.code);
+                    
+                    if (similarity > 0.7) {
+                        matches.push({
+                            assistantMessage: block.code,
+                            similarity: similarity,
+                            matchedPortion: block.code
+                        });
+                    }
+                });
+
+                // Also check if the content matches a portion of the entire code block
+                const fullCodeBlock = codeBlocks.map(b => b.code).join('\n\n');
+                const partialMatches = this.findPartialCodeMatches(content, fullCodeBlock);
+                
+                partialMatches.forEach(match => {
+                    if (match.similarity > 0.7) {
+                        matches.push({
+                            assistantMessage: match.matchedPortion,
+                            similarity: match.similarity,
+                            matchedPortion: match.matchedPortion
+                        });
+                    }
+                });
+            } else {
+                // No code blocks, check text similarity
+                const textSimilarity = this.calculateSimilarity(content, assistantMsg);
+                if (textSimilarity > 0.7) {
+                    const matchedText = this.findBestMatchingSubstring(content, assistantMsg);
+                    matches.push({
+                        assistantMessage: matchedText,
+                        similarity: textSimilarity,
+                        matchedPortion: matchedText
+                    });
+                }
+            }
+        });
+
+        // Remove duplicate matches and keep only the best
+        const uniqueMatches = this.deduplicateMatches(matches);
+
+        // Calculate overall similarity
+        const overallSimilarity = uniqueMatches.length > 0
+            ? Math.max(...uniqueMatches.map(m => m.similarity))
+            : 0;
+
+        return {
+            isAIGenerated: uniqueMatches.length > 0 && overallSimilarity > 0.7,
+            matchedMessages: uniqueMatches.sort((a, b) => b.similarity - a.similarity),
+            overallSimilarity: overallSimilarity
+        };
+    }
+
+    private findPartialCodeMatches(content: string, fullCode: string): Array<{
+        similarity: number;
+        matchedPortion: string;
+    }> {
+        const matches: Array<{ similarity: number; matchedPortion: string }> = [];
+        const normalize = (str: string) => str.replace(/\s+/g, ' ').trim().toLowerCase();
+        
+        // Split the full code into functions/classes/blocks
+        const codeSegments = this.splitCodeIntoSegments(fullCode);
+        
+        codeSegments.forEach(segment => {
+            const similarity = this.calculateSimilarity(content, segment);
+            if (similarity > 0.7) {
+                matches.push({
+                    similarity: similarity,
+                    matchedPortion: segment
+                });
+            }
+        });
+
+        return matches;
+    }
+
+    private splitCodeIntoSegments(code: string): string[] {
+        const segments: string[] = [];
+        const lines = code.split('\n');
+        
+        let currentSegment: string[] = [];
+        let inFunction = false;
+        let indentLevel = 0;
+        
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            const trimmedLine = line.trim();
+            
+            // Detect function/class definition
+            if (trimmedLine.startsWith('def ') || 
+                trimmedLine.startsWith('class ') ||
+                trimmedLine.startsWith('function ') ||
+                trimmedLine.startsWith('const ') ||
+                trimmedLine.startsWith('let ') ||
+                trimmedLine.startsWith('var ')) {
+                
+                // Save previous segment if exists
+                if (currentSegment.length > 0) {
+                    segments.push(currentSegment.join('\n'));
+                }
+                
+                // Start new segment
+                currentSegment = [line];
+                inFunction = true;
+                indentLevel = line.length - line.trimStart().length;
+            } else if (inFunction) {
+                currentSegment.push(line);
+                
+                // Check if function/block ended (back to original indent or less)
+                const currentIndent = line.length - line.trimStart().length;
+                if (trimmedLine.length > 0 && currentIndent <= indentLevel && i < lines.length - 1) {
+                    const nextLine = lines[i + 1];
+                    const nextTrimmed = nextLine.trim();
+                    if (nextTrimmed.startsWith('def ') || 
+                        nextTrimmed.startsWith('class ') ||
+                        nextTrimmed.startsWith('function ') ||
+                        nextTrimmed === '') {
+                        // Function ended
+                        segments.push(currentSegment.join('\n'));
+                        currentSegment = [];
+                        inFunction = false;
+                    }
+                }
+            } else {
+                currentSegment.push(line);
+            }
+        }
+        
+        // Add last segment
+        if (currentSegment.length > 0) {
+            segments.push(currentSegment.join('\n'));
+        }
+        
+        return segments.filter(s => s.trim().length > 0);
+    }
+
+    private deduplicateMatches(matches: Array<{
+        assistantMessage: string;
+        similarity: number;
+        matchedPortion: string;
+    }>): Array<{
+        assistantMessage: string;
+        similarity: number;
+        matchedPortion: string;
+    }> {
+        if (matches.length === 0) {
+            return matches;
+        }
+
+        // Group similar matches
+        const groups: Array<Array<typeof matches[0]>> = [];
+        
+        matches.forEach(match => {
+            let addedToGroup = false;
+            
+            for (const group of groups) {
+                const representative = group[0];
+                const similarity = this.calculateSimilarity(
+                    match.matchedPortion, 
+                    representative.matchedPortion
+                );
+                
+                if (similarity > 0.9) {
+                    group.push(match);
+                    addedToGroup = true;
+                    break;
+                }
+            }
+            
+            if (!addedToGroup) {
+                groups.push([match]);
+            }
+        });
+
+        // From each group, keep only the best match
+        return groups.map(group => {
+            return group.reduce((best, current) => {
+                return current.similarity > best.similarity ? current : best;
+            });
+        });
+    }
