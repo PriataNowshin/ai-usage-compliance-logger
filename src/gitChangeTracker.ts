@@ -1,8 +1,17 @@
 import * as vscode from 'vscode';
 import { ChatbotPanel } from './chatbotPanel';
 
+interface LineMatch {
+    fileLineNumber: number;
+    chatbotLine: string;
+    fileLineContent: string;
+    userPrompt: string;
+    timestamp: string;
+}
+
 export class GitChangeTracker {
     private context: vscode.ExtensionContext;
+    private documentMatches: Map<string, LineMatch[]> = new Map();
 
     constructor(context: vscode.ExtensionContext) {
         this.context = context;
@@ -42,15 +51,15 @@ export class GitChangeTracker {
 
             this.printDifferencesToConsole(differences, document);
 
-            // Check if changes were AI-generated
-            await this.checkAIGeneratedChanges(differences, document);
+            // Check for exact line-by-line matches with AI-generated content
+            await this.checkExactLineMatches(differences, document);
 
         } catch (error) {
             console.error('Error:', error);
         }
     }
 
-    private async checkAIGeneratedChanges(differences: any, document: vscode.TextDocument): Promise<void> {
+    private async checkExactLineMatches(differences: any, document: vscode.TextDocument): Promise<void> {
         const chatbot = ChatbotPanel.getCurrentPanel();
         
         if (!chatbot) {
@@ -58,221 +67,212 @@ export class GitChangeTracker {
             return;
         }
 
-        let highestSimilarity = 0;
-        let bestMatch: any = null;
-        let matchType = '';
-        let matchedContent = '';
+        // Get conversation history with timestamps
+        const conversationHistory = chatbot.getConversationHistory();
+        
+        console.log('\n🔍 Starting exact line-by-line matching...');
+        console.log(`Total conversation messages: ${conversationHistory.length}`);
+        console.log(`Added lines to check: ${differences.added.length}`);
+        console.log(`Modified lines to check: ${differences.modified.length}`);
 
-        // Extract code segments from added lines
+        const matches: LineMatch[] = [];
+        const author = await this.getGitAuthor();
+
+        // Check added lines for exact matches
         if (differences.added.length > 0) {
-            const addedContent = differences.added.map((line: any) => line.content).join('\n');
-            const codeSegments = this.extractCodeSegmentsFromChanges(addedContent);
+            console.log('\n📝 Checking ADDED lines for exact matches:');
             
-            // Check each segment individually
-            for (const segment of codeSegments) {
-                const aiCheck = chatbot.checkAIGeneratedContent(segment);
+            for (const addedLine of differences.added) {
+                const trimmedFileLine = addedLine.content.trim();
                 
-                if (aiCheck.isAIGenerated && aiCheck.matchedMessages.length > 0) {
-                    const topMatch = aiCheck.matchedMessages[0];
-                    if (topMatch.similarity > highestSimilarity) {
-                        highestSimilarity = topMatch.similarity;
-                        bestMatch = topMatch;
-                        matchType = 'ADDED';
-                        matchedContent = segment;
-                    }
+                // Skip empty lines
+                if (trimmedFileLine.length === 0) {
+                    continue;
                 }
-            }
-            
-            // If no segments found or low similarity, check the entire added content
-            if (highestSimilarity < 0.8) {
-                const aiCheck = chatbot.checkAIGeneratedContent(addedContent);
-                if (aiCheck.isAIGenerated && aiCheck.matchedMessages.length > 0) {
-                    const topMatch = aiCheck.matchedMessages[0];
-                    if (topMatch.similarity > highestSimilarity) {
-                        highestSimilarity = topMatch.similarity;
-                        bestMatch = topMatch;
-                        matchType = 'ADDED';
-                        matchedContent = addedContent;
-                    }
-                }
-            }
-        }
 
-        // Extract code segments from modified lines
-        if (differences.modified.length > 0) {
-            const modifiedContent = differences.modified.map((line: any) => line.newContent).join('\n');
-            const codeSegments = this.extractCodeSegmentsFromChanges(modifiedContent);
-            
-            // Check each segment individually
-            for (const segment of codeSegments) {
-                const aiCheck = chatbot.checkAIGeneratedContent(segment);
-                
-                if (aiCheck.isAIGenerated && aiCheck.matchedMessages.length > 0) {
-                    const topMatch = aiCheck.matchedMessages[0];
-                    if (topMatch.similarity > highestSimilarity) {
-                        highestSimilarity = topMatch.similarity;
-                        bestMatch = topMatch;
-                        matchType = 'MODIFIED';
-                        matchedContent = segment;
-                    }
-                }
-            }
-            
-            // If no segments found or low similarity, check the entire modified content
-            if (highestSimilarity < 0.8) {
-                const aiCheck = chatbot.checkAIGeneratedContent(modifiedContent);
-                if (aiCheck.isAIGenerated && aiCheck.matchedMessages.length > 0) {
-                    const topMatch = aiCheck.matchedMessages[0];
-                    if (topMatch.similarity > highestSimilarity) {
-                        highestSimilarity = topMatch.similarity;
-                        bestMatch = topMatch;
-                        matchType = 'MODIFIED';
-                        matchedContent = modifiedContent;
-                    }
-                }
-            }
-        }
+                console.log(`  Checking line ${addedLine.lineNumber}: "${trimmedFileLine}"`);
 
-        // Log only if we found a match
-        if (bestMatch && highestSimilarity > 0.7) {
-            console.log('\n' + '⚠'.repeat(80));
-            console.log(`AI-GENERATED CONTENT DETECTED IN ${matchType} LINES`);
-            console.log('⚠'.repeat(80));
-            console.log(`Maximum Similarity: ${(highestSimilarity * 100).toFixed(2)}%`);
-            console.log(`\nChanged Code Segment:`);
-            console.log('-'.repeat(80));
-            console.log(matchedContent.substring(0, 500)); // Show first 500 chars
-            console.log('-'.repeat(80));
-            console.log(`\nMatched Content from Chatbot:`);
-            console.log('-'.repeat(80));
-            console.log(bestMatch.matchedPortion.substring(0, 500)); // Show first 500 chars
-            console.log('-'.repeat(80));
-            console.log('⚠'.repeat(80) + '\n');
-
-            // Show VS Code notification
-            const action = await vscode.window.showWarningMessage(
-                `AI-generated content detected (${(highestSimilarity * 100).toFixed(0)}% match)`,
-                'View Details',
-                'Ignore'
-            );
-
-            if (action === 'View Details') {
-                await this.showDetailedAIReport(matchedContent, bestMatch, highestSimilarity, matchType, document);
-            }
-        }
-    }
-
-    private extractCodeSegmentsFromChanges(content: string): string[] {
-        const segments: string[] = [];
-        const lines = content.split('\n');
-        
-        let currentSegment: string[] = [];
-        let inBlock = false;
-        let baseIndent = 0;
-        
-        for (let i = 0; i < lines.length; i++) {
-            const line = lines[i];
-            const trimmedLine = line.trim();
-            const currentIndent = line.length - line.trimStart().length;
-            
-            if (trimmedLine.length === 0 && !inBlock) {
-                continue;
-            }
-            
-            // Detect function/class/block definition
-            const isBlockStart = 
-                trimmedLine.startsWith('def ') || 
-                trimmedLine.startsWith('class ') ||
-                trimmedLine.startsWith('function ') ||
-                trimmedLine.startsWith('const ') && (trimmedLine.includes('= function') || trimmedLine.includes('=> ')) ||
-                trimmedLine.startsWith('let ') && (trimmedLine.includes('= function') || trimmedLine.includes('=> ')) ||
-                trimmedLine.startsWith('async ') ||
-                trimmedLine.startsWith('export ');
-            
-            if (isBlockStart) {
-                if (currentSegment.length > 0) {
-                    segments.push(currentSegment.join('\n').trim());
-                }
-                
-                currentSegment = [line];
-                inBlock = true;
-                baseIndent = currentIndent;
-            } else if (inBlock) {
-                currentSegment.push(line);
-                
-                if (trimmedLine.length > 0 && currentIndent <= baseIndent && i > 0) {
-                    const nextLine = i < lines.length - 1 ? lines[i + 1] : '';
-                    const nextTrimmed = nextLine.trim();
+                // Check against each assistant message in conversation history
+                for (let msgIndex = 0; msgIndex < conversationHistory.length; msgIndex++) {
+                    const msg = conversationHistory[msgIndex];
                     
-                    if (nextTrimmed.length === 0 || 
-                        nextTrimmed.startsWith('def ') ||
-                        nextTrimmed.startsWith('class ') ||
-                        nextTrimmed.startsWith('function ') ||
-                        i === lines.length - 1) {
-                        segments.push(currentSegment.join('\n').trim());
-                        currentSegment = [];
-                        inBlock = false;
+                    if (msg.role === 'assistant') {
+                        const chatbotLines = msg.content.split('\n');
+                        
+                        for (const chatbotLine of chatbotLines) {
+                            const trimmedChatbotLine = chatbotLine.trim();
+                            
+                            // Exact match check
+                            if (trimmedFileLine === trimmedChatbotLine && trimmedChatbotLine.length > 0) {
+                                // Find the user prompt that led to this response
+                                const userPrompt = this.findUserPromptForResponse(conversationHistory, msgIndex);
+                                
+                                console.log(`    ✅ EXACT MATCH FOUND!`);
+                                console.log(`       Chatbot line: "${trimmedChatbotLine}"`);
+                                console.log(`       User prompt: "${userPrompt.substring(0, 50)}..."`);
+                                
+                                matches.push({
+                                    fileLineNumber: addedLine.lineNumber,
+                                    chatbotLine: trimmedChatbotLine,
+                                    fileLineContent: trimmedFileLine,
+                                    userPrompt: userPrompt,
+                                    timestamp: msg.timestamp.toISOString()
+                                });
+                                
+                                // Break after finding first match for this line
+                                break;
+                            }
+                        }
                     }
-                }
-            } else {
-                if (trimmedLine.length > 0) {
-                    currentSegment.push(line);
                 }
             }
         }
-        
-        if (currentSegment.length > 0) {
-            segments.push(currentSegment.join('\n').trim());
+
+        // Check modified lines for exact matches
+        if (differences.modified.length > 0) {
+            console.log('\n📝 Checking MODIFIED lines for exact matches:');
+            
+            for (const modifiedLine of differences.modified) {
+                const trimmedFileLine = modifiedLine.newContent.trim();
+                
+                // Skip empty lines
+                if (trimmedFileLine.length === 0) {
+                    continue;
+                }
+
+                console.log(`  Checking line ${modifiedLine.lineNumber}: "${trimmedFileLine}"`);
+
+                // Check against each assistant message in conversation history
+                for (let msgIndex = 0; msgIndex < conversationHistory.length; msgIndex++) {
+                    const msg = conversationHistory[msgIndex];
+                    
+                    if (msg.role === 'assistant') {
+                        const chatbotLines = msg.content.split('\n');
+                        
+                        for (const chatbotLine of chatbotLines) {
+                            const trimmedChatbotLine = chatbotLine.trim();
+                            
+                            // Exact match check
+                            if (trimmedFileLine === trimmedChatbotLine && trimmedChatbotLine.length > 0) {
+                                // Find the user prompt that led to this response
+                                const userPrompt = this.findUserPromptForResponse(conversationHistory, msgIndex);
+                                
+                                console.log(`    ✅ EXACT MATCH FOUND!`);
+                                console.log(`       Chatbot line: "${trimmedChatbotLine}"`);
+                                console.log(`       User prompt: "${userPrompt.substring(0, 50)}..."`);
+                                
+                                matches.push({
+                                    fileLineNumber: modifiedLine.lineNumber,
+                                    chatbotLine: trimmedChatbotLine,
+                                    fileLineContent: trimmedFileLine,
+                                    userPrompt: userPrompt,
+                                    timestamp: msg.timestamp.toISOString()
+                                });
+                                
+                                // Break after finding first match for this line
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
         }
-        
-        return segments.filter(s => s.trim().length > 20);
+
+        // Remove duplicates (same line number)
+        const uniqueMatches = this.removeDuplicateMatches(matches);
+
+        console.log(`\n✅ Total exact matches found: ${uniqueMatches.length}`);
+
+        // Store matches for this document
+        this.documentMatches.set(document.uri.toString(), uniqueMatches);
+
+        // Display results
+        if (uniqueMatches.length > 0) {
+            this.displayMatchResults(uniqueMatches, author, document);
+        } else {
+            console.log('\n✓ No exact line matches found with chatbot code.');
+        }
     }
 
-    private async showDetailedAIReport(
-        changedContent: string,
-        bestMatch: any, 
-        similarity: number, 
-        matchType: string, 
-        document: vscode.TextDocument
-    ): Promise<void> {
-        const report = `# AI Content Detection Report
+    private findUserPromptForResponse(conversationHistory: any[], assistantIndex: number): string {
+        // Look backward from the assistant message to find the most recent user message
+        for (let i = assistantIndex - 1; i >= 0; i--) {
+            if (conversationHistory[i].role === 'user') {
+                // Remove file context info if present
+                let content = conversationHistory[i].content;
+                const userQuestionMatch = content.match(/User Question: (.+)/s);
+                if (userQuestionMatch) {
+                    return userQuestionMatch[1].trim();
+                }
+                return content;
+            }
+        }
+        return 'No user prompt found';
+    }
 
-**File:** ${document.fileName}
-**Match Type:** ${matchType} Lines
-**Similarity:** ${(similarity * 100).toFixed(2)}%
+    private removeDuplicateMatches(matches: LineMatch[]): LineMatch[] {
+        const seen = new Set<number>();
+        return matches.filter(match => {
+            if (seen.has(match.fileLineNumber)) {
+                return false;
+            }
+            seen.add(match.fileLineNumber);
+            return true;
+        });
+    }
 
----
+    private displayMatchResults(matches: LineMatch[], author: string, document: vscode.TextDocument): void {
+        console.log('\n' + '⚠'.repeat(80));
+        console.log(`🤖 EXACT LINE MATCHES DETECTED: ${matches.length} line(s)`);
+        console.log('⚠'.repeat(80));
 
-## Changed Code in File
+        // Sort by line number
+        matches.sort((a, b) => a.fileLineNumber - b.fileLineNumber);
 
-\`\`\`${document.languageId}
-${changedContent}
-\`\`\`
-
----
-
-## Matched Content from Chatbot
-
-\`\`\`
-${bestMatch.matchedPortion}
-\`\`\`
-
----
-
-## Analysis
-
-- **Similarity Score:** ${(similarity * 100).toFixed(2)}%
-- **Match Quality:** ${similarity > 0.95 ? 'Exact Match' : similarity > 0.85 ? 'Very High' : 'High'}
-
-${similarity > 0.95 ? '⚠️ **Warning:** This appears to be an exact or near-exact copy from the AI assistant.' : ''}
-`;
-
-        const doc = await vscode.workspace.openTextDocument({
-            content: report,
-            language: 'markdown'
+        console.log('\n📍 MATCHED LINES:');
+        matches.forEach(match => {
+            console.log(`\n  Line ${match.fileLineNumber} - 100% EXACT MATCH`);
+            console.log(`    Content: "${match.fileLineContent}"`);
+            console.log(`    Author: ${author}`);
+            console.log(`    Timestamp: ${new Date(match.timestamp).toLocaleString()}`);
+            console.log(`    Purpose: ${match.userPrompt.substring(0, 100)}${match.userPrompt.length > 100 ? '...' : ''}`);
         });
 
-        await vscode.window.showTextDocument(doc, vscode.ViewColumn.Beside);
+        console.log('\n' + '-'.repeat(80));
+
+        // Summary
+        const lineNumbers = matches.map(m => m.fileLineNumber).join(', ');
+        console.log(`\n✅ SUMMARY: Line(s) ${lineNumbers} are 100% exact matches from AI chatbot`);
+        console.log('⚠'.repeat(80) + '\n');
+
+        // Show VS Code notification
+        vscode.window.showWarningMessage(
+            `🤖 AI-generated: ${matches.length} line(s) matched exactly (Lines: ${lineNumbers})`,
+            'View Details'
+        ).then(selection => {
+            if (selection === 'View Details') {
+                vscode.commands.executeCommand('workbench.action.terminal.focus');
+            }
+        });
+    }
+
+    private async getGitAuthor(): Promise<string> {
+        try {
+            const git = await this.getGitExtension();
+            if (!git) {
+                return 'Unknown';
+            }
+
+            const repo = this.getGitRepository(git);
+            if (!repo) {
+                return 'Unknown';
+            }
+
+            const config = await repo.getConfig('user.name');
+            return config || 'Unknown';
+        } catch (error) {
+            return 'Unknown';
+        }
     }
 
     private async getGitExtension(): Promise<any> {

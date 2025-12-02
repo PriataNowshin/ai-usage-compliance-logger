@@ -26,7 +26,7 @@ export class ChatbotPanel {
         // Initialize OpenAI immediately
         this.openai = new OpenAI({
             baseURL: "https://openrouter.ai/api/v1",
-            apiKey: "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",
+            apiKey: "",
         });
         
         // Load conversation history from storage FIRST
