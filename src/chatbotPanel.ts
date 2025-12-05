@@ -310,6 +310,10 @@ export class ChatbotPanel {
         return this.conversationHistory;
     }
 
+    public getSelectedModel(): string {
+        return this.selectedModel || 'openai/gpt-oss-20b:free';
+    }
+
     private getHtmlContent(): string {
         return `<!DOCTYPE html>
 <html lang="en">
