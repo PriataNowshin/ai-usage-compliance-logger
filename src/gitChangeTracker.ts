@@ -1,1325 +1,570 @@
+/**
+ * Git change tracker and authorship attribution orchestrator
+ * Listens for file save events, analyzes diffs, and attributes code authorship
+ */
+
 import * as vscode from 'vscode';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { ChatbotPanel } from './chatbotPanel';
-import OpenAI from 'openai';
-
-interface LineMatch {
-    fileLineNumber: number;
-    chatbotLine: string;
-    fileLineContent: string;
-    userPrompt: string;
-    timestamp: string;
-    modelName: string;
-}
-
-interface FunctionGroup {
-    functionStartLine: number;
-    purposeGroups: Map<string, number[]>; // purpose -> line numbers
-    author: string;
-    timestamp: string;
-    modelName: string;
-}
+import { ConversationParser } from './conversationParser';
+import { DiffParser } from './diffParser';
+import { CodeSimilarityMatcher } from './codeSimilarityMatcher';
+import { AuthorshipAttributor } from './authorshipAttributor';
+import { CodeTagInserter } from './codeTagInserter';
+import { AttributionLogger } from './attributionLogger';
+import { CommitAnalysisResult, AuthorshipConfig } from './types';
 
 export class GitChangeTracker {
-    private context: vscode.ExtensionContext;
-    private documentMatches: Map<string, LineMatch[]> = new Map();
-    private taggedFunctions: Map<string, Set<number>> = new Map(); // Track which functions already have tags
-    private openai: OpenAI;
+  private context: vscode.ExtensionContext;
+  private conversationParser: ConversationParser;
+  private diffParser: DiffParser;
+  private attributor: AuthorshipAttributor;
+  private tagInserter: CodeTagInserter;
+  private logger: AttributionLogger;
+  private config: AuthorshipConfig;
+  private lastAnalyzedCommit: string | null = null;
+  private git: any = null;
+  private repositorySubscriptions = new Map<string, vscode.Disposable>();
+  private execFileAsync = promisify(execFile);
 
-    constructor(context: vscode.ExtensionContext) {
-        this.context = context;
-        this.openai = new OpenAI({
-            baseURL: "https://openrouter.ai/api/v1",
-            apiKey: "",
+  constructor(context: vscode.ExtensionContext) {
+    this.context = context;
+    this.conversationParser = new ConversationParser();
+    this.diffParser = new DiffParser();
+    this.attributor = new AuthorshipAttributor();
+    this.tagInserter = new CodeTagInserter();
+    this.logger = new AttributionLogger();
+
+    // Default configuration
+    this.config = {
+      minSimilarityThreshold: 75,
+      fuzzyMatchThreshold: 60,
+      analyzeFullConversation: true,
+      insertTags: true,
+      createLogs: true
+    };
+  }
+
+  /**
+   * Activate the git change tracker
+   */
+  public async activate(): Promise<void> {
+    const isMonitoring = await this.setupGitCommitListener();
+
+    if (isMonitoring) {
+      console.log('[AuthorshipTracker] Git change tracker activated - monitoring commits');
+    } else {
+      console.log('[AuthorshipTracker] Git change tracker activated - waiting for repository');
+    }
+  }
+
+  /**
+   * Setup listener for git commit events
+   */
+  private async setupGitCommitListener(): Promise<boolean> {
+    try {
+      this.git = await this.getGitExtension();
+      if (!this.git) {
+        console.log('[AuthorshipTracker] Git not available - tracker inactive');
+        return false;
+      }
+
+      // Attach to any repositories already open.
+      for (const repo of this.git.repositories) {
+        await this.attachRepositoryListener(repo);
+      }
+
+      // Also handle repositories that open after startup.
+      if (typeof this.git.onDidOpenRepository === 'function') {
+        const openRepoDisposable = this.git.onDidOpenRepository((repo: any) => {
+          void this.attachRepositoryListener(repo).catch((error: any) => {
+            console.error('[AuthorshipTracker] Failed attaching newly opened repository:', error);
+          });
         });
+        this.context.subscriptions.push(openRepoDisposable);
+      }
+
+      return this.repositorySubscriptions.size > 0;
+    } catch (error) {
+      console.error('[AuthorshipTracker] Failed to setup git listener:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Attach commit listener to a repository if not already attached.
+   */
+  private async attachRepositoryListener(repo: any): Promise<void> {
+    const repoPath = repo?.rootUri?.fsPath;
+    if (!repoPath || this.repositorySubscriptions.has(repoPath)) {
+      return;
     }
 
-    public activate(): void {
-        this.setupFileSaveListener();
+    // Keep latest commit per currently attached repository.
+    this.lastAnalyzedCommit = await this.getCurrentCommitHash(repo);
+    console.log(`[AuthorshipTracker] Repository detected: ${repoPath}`);
+    console.log(`[AuthorshipTracker] Initial commit: ${this.lastAnalyzedCommit}`);
+
+    const disposable = this.createRepositoryChangeSubscription(repo, repoPath);
+
+    this.repositorySubscriptions.set(repoPath, disposable);
+    this.context.subscriptions.push(disposable);
+  }
+
+  /**
+   * Subscribe to repository changes across multiple Git API versions.
+   */
+  private createRepositoryChangeSubscription(repo: any, repoPath: string): vscode.Disposable {
+    const disposables: vscode.Disposable[] = [];
+
+    const onRepoChange = () => {
+      void this.checkForNewCommit(repo).catch((error: any) => {
+        console.error(`[AuthorshipTracker] Error while processing repository change for ${repoPath}:`, error);
+      });
+    };
+
+    if (typeof repo.onDidChangeRepository === 'function') {
+      disposables.push(repo.onDidChangeRepository(onRepoChange));
+    } else if (repo?.state && typeof repo.state.onDidChange === 'function') {
+      disposables.push(repo.state.onDidChange(onRepoChange));
+    } else {
+      console.log(`[AuthorshipTracker] Repository change event unavailable for ${repoPath}; using polling fallback`);
     }
 
-    private setupFileSaveListener(): void {
-        const disposable = vscode.workspace.onDidSaveTextDocument(async (document) => {
-            await this.checkChangesAgainstGit(document);
-        });
+    // Polling ensures commit detection even when Git API events are inconsistent.
+    const interval = setInterval(onRepoChange, 3000);
+    disposables.push(new vscode.Disposable(() => clearInterval(interval)));
 
-        this.context.subscriptions.push(disposable);
+    return new vscode.Disposable(() => {
+      for (const disposable of disposables) {
+        disposable.dispose();
+      }
+    });
+  }
+
+  /**
+   * Check if there's a new commit and analyze it
+   */
+  private async checkForNewCommit(repo: any): Promise<void> {
+    try {
+      const currentCommitHash = await this.getCurrentCommitHash(repo);
+
+      if (!currentCommitHash) {
+        return;
+      }
+
+      // Only analyze if commit has changed
+      if (currentCommitHash === this.lastAnalyzedCommit) {
+        return;
+      }
+
+      console.log(`\n[AuthorshipTracker] New commit detected: ${currentCommitHash}`);
+      this.lastAnalyzedCommit = currentCommitHash;
+
+      // Analyze the new commit
+      await this.analyzeCommitChanges(repo, currentCommitHash);
+    } catch (error) {
+      console.error('[AuthorshipTracker] Error checking for new commit:', error);
     }
+  }
 
-    private async checkChangesAgainstGit(document: vscode.TextDocument): Promise<void> {
+  /**
+   * Analyze changes in a commit
+   * Gets all files from the commit and analyzes them
+   */
+  private async analyzeCommitChanges(repo: any, commitHash: string): Promise<void> {
+    try {
+      console.log(`[AuthorshipTracker] Analyzing commit: ${commitHash}`);
+
+      const conversationHistory = this.getConversationHistoryForAnalysis();
+      if (conversationHistory.length === 0) {
+        console.log('[AuthorshipTracker] No conversation history found - continuing with HUMAN_WRITTEN defaults');
+      }
+
+      // Get files changed in this commit
+      const committedFiles = await this.getCommitFiles(repo, commitHash);
+      if (!committedFiles || committedFiles.length === 0) {
+        console.log('[AuthorshipTracker] No files changed in commit');
+        return;
+      }
+
+      console.log(`[AuthorshipTracker] Files in commit: ${committedFiles.length}`);
+
+      // ========== ATTRIBUTION PIPELINE ==========
+
+      // 1. Parse full conversation history
+      console.log('[AuthorshipTracker] Step 1: Parsing conversation history...');
+      const parsedConversation = this.conversationParser.parseConversation(conversationHistory);
+      console.log(`  ✓ Found ${parsedConversation.totalMessages} messages with ${parsedConversation.codeSnippets.length} code snippets`);
+
+      // 2. Analyze each file in the commit
+      console.log('[AuthorshipTracker] Step 2: Analyzing commit diff...');
+      const allAttributions: any[] = [];
+      const allCodeBlocks: any[] = [];
+
+      for (const fileInfo of committedFiles) {
+        const { filePath, status } = fileInfo;
+
+        // Skip deleted files
+        if (status === 'D') {
+          console.log(`  - Skipping deleted file: ${filePath}`);
+          continue;
+        }
+
         try {
-            const git = await this.getGitExtension();
-            if (!git) {
-                return;
+          // Get current version
+          const currentContent = await this.getFileFromCommit(repo, commitHash, filePath);
+          const previousContent = await this.getFileFromCommit(repo, `${commitHash}^`, filePath);
+
+          if (!currentContent) {
+            console.log(`  - Skipping ${filePath} (not accessible)`);
+            continue;
+          }
+
+          // Calculate diff
+          const diffContent = this.calculateDiff(previousContent || '', currentContent);
+          const hunks = this.diffParser.parseDiff(diffContent, filePath);
+          const virtualDocument = await vscode.workspace.openTextDocument({ content: currentContent });
+          const changedCodeBlocks = this.diffParser.extractCodeBlocks(hunks, virtualDocument, filePath);
+          const allFunctionBlocks = this.diffParser.extractAllFunctionBlocks(virtualDocument, filePath);
+
+          const codeBlocks = allFunctionBlocks.length > 0 ? allFunctionBlocks : changedCodeBlocks;
+
+          if (codeBlocks.length > 0) {
+            if (allFunctionBlocks.length > 0) {
+              console.log(`  ✓ ${filePath}: ${codeBlocks.length} function block(s) (full-file coverage)`);
+            } else {
+              console.log(`  ✓ ${filePath}: ${codeBlocks.length} code block(s) (diff coverage)`);
             }
-
-            const repo = this.getGitRepository(git);
-            if (!repo) {
-                return;
-            }
-
-            const oldContent = await this.getLastCommittedVersion(repo, document);
-            if (!oldContent) {
-                return;
-            }
-
-            const newContent = document.getText();
-            const differences = this.calculateDetailedDifferences(oldContent, newContent);
-
-            this.printDifferencesToConsole(differences, document);
-
-            // Check for exact line-by-line matches with AI-generated content
-            await this.checkExactLineMatches(differences, document);
-
+            allCodeBlocks.push(...codeBlocks);
+          }
         } catch (error) {
-            console.error('Error:', error);
+          console.log(`  - Error analyzing ${filePath}:`, error);
         }
+      }
+
+      if (allCodeBlocks.length === 0) {
+        console.log('[AuthorshipTracker] No code blocks to analyze');
+        return;
+      }
+
+      // 3. Attribute authorship
+      console.log('[AuthorshipTracker] Step 3: Attributing code authorship...');
+      const attributions = this.attributor.attributeCodeBlocks(allCodeBlocks, parsedConversation);
+
+      const summary = this.attributor.getSummary(attributions);
+      console.log(`  ✓ Results: ${summary.llmGenerated} LLM, ${summary.humanPrompt} Human-Prompted, ${summary.humanWritten} Human-Written`);
+      console.log(`  ✓ Average Confidence: ${(summary.averageConfidence * 100).toFixed(1)}%`);
+
+      if (this.config.insertTags) {
+        console.log('[AuthorshipTracker] Step 4: Inserting authorship tags into files...');
+        await this.insertAuthorshipTags(repo, attributions);
+      }
+
+      // 4. Log results
+      if (this.config.createLogs) {
+        console.log('[AuthorshipTracker] Step 5: Creating structured logs...');
+        const analysisResult: CommitAnalysisResult = {
+          commitHash: commitHash,
+          timestamp: new Date(),
+          filesAnalyzed: committedFiles.map(f => f.filePath),
+          codeBlocksFound: allCodeBlocks,
+          attributions,
+          tags: this.tagInserter.generateTags(attributions),
+          statistics: {
+            totalNewLines: allCodeBlocks.reduce((sum, b) => sum + (b.endLine - b.startLine), 0),
+            analyzedLines: allCodeBlocks.length,
+            llmGeneratedLines: summary.llmGenerated,
+            humanPromptLines: summary.humanPrompt,
+            humanWrittenLines: summary.humanWritten,
+            mixedLines: summary.mixed,
+            uncertainLines: summary.uncertain
+          }
+        };
+
+        const logPath = this.logger.logAnalysis(analysisResult);
+        console.log(`  ✓ Log created at: ${logPath}`);
+      }
+
+      // 5. Show summary
+      vscode.window.showInformationMessage(
+        `Authorship Analysis: ${summary.llmGenerated} LLM, ${summary.humanPrompt} Human-Prompted, ${summary.humanWritten} Human-Written`,
+        'View Logs'
+      ).then(selection => {
+        if (selection === 'View Logs') {
+          const logDir = this.getLogsDirectory();
+          vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(logDir));
+        }
+      });
+
+      console.log('[AuthorshipTracker] Commit analysis complete! ✓');
+
+    } catch (error) {
+      console.error('[AuthorshipTracker] Error during commit analysis:', error);
+      vscode.window.showErrorMessage(`Authorship tracking failed: ${error}`);
+    }
+  }
+
+  /**
+   * Get conversation history from active chatbot panel when available,
+   * otherwise fall back to persisted extension state.
+   */
+  private getConversationHistoryForAnalysis(): any[] {
+    const chatbot = ChatbotPanel.getCurrentPanel();
+    if (chatbot) {
+      return chatbot.getConversationHistory();
     }
 
-    private async checkExactLineMatches(differences: any, document: vscode.TextDocument): Promise<void> {
-        const chatbot = ChatbotPanel.getCurrentPanel();
-        
-        if (!chatbot) {
-            console.log('Chatbot not available for AI content detection');
-            return;
-        }
-
-        const conversationHistory = chatbot.getConversationHistory();
-        const selectedModel = this.getSelectedModelName(chatbot);
-        
-        console.log('\n🔍 Starting exact line-by-line matching...');
-        console.log(`Total conversation messages: ${conversationHistory.length}`);
-        console.log(`Added lines to check: ${differences.added.length}`);
-        console.log(`Modified lines to check: ${differences.modified.length}`);
-
-        const matches: LineMatch[] = [];
-        const author = await this.getGitAuthor();
-
-        // Create a Set of all lines from the OLD (Git committed) version for fast lookup
-        const oldLinesFromGit = new Set(
-            differences.oldContent
-                .split('\n')
-                .map((line: string) => line.trim())
-                .filter((line: string) => line.length > 0)
-        );
-        
-        console.log(`📜 Old version (from Git) has ${oldLinesFromGit.size} unique non-empty lines`);
-
-        // CRITICAL: Get the MOST RECENT assistant response (last one in conversation)
-        const recentResponses = conversationHistory
-            .filter((msg: any) => msg.role === 'assistant')
-            .slice(-3); // Only check last 3 assistant responses (most recent edits)
-
-        console.log(`\n🎯 Checking only against ${recentResponses.length} most recent assistant response(s)`);
-
-        // For each recent response, find what lines were TRULY generated by the LLM
-        // by checking what was in the user's prompt (context) vs what the LLM returned
-        const trulyAIGeneratedLines = new Map<string, { userPrompt: string, timestamp: Date, msgIndex: number }>();
-        
-        for (let i = 0; i < recentResponses.length; i++) {
-            const msg = recentResponses[i];
-            const actualMsgIndex = conversationHistory.indexOf(msg);
-            const userPrompt = this.findUserPromptForResponse(conversationHistory, actualMsgIndex);
-            
-            // Extract code that the user provided as context in their prompt
-            const userProvidedCode = this.extractCodeFromPrompt(userPrompt);
-            const userProvidedLines = new Set(
-                userProvidedCode
-                    .split('\n')
-                    .map((line: string) => line.trim())
-                    .filter((line: string) => line.length > 0)
-            );
-            
-            console.log(`\n  📋 Response ${i + 1}: User provided ${userProvidedLines.size} lines of context in their prompt`);
-            
-            // Lines in LLM response that were NOT in user's prompt = truly AI-generated
-            const llmResponseLines = msg.content.split('\n');
-            for (const line of llmResponseLines) {
-                const trimmedLine = line.trim();
-                if (trimmedLine.length > 0 && 
-                    !userProvidedLines.has(trimmedLine) && 
-                    !trimmedLine.includes('@LLM_Generated')) {
-                    
-                    // Only add if not already tracked (prefer most recent)
-                    if (!trulyAIGeneratedLines.has(trimmedLine)) {
-                        trulyAIGeneratedLines.set(trimmedLine, {
-                            userPrompt: userPrompt,
-                            timestamp: msg.timestamp,
-                            msgIndex: actualMsgIndex
-                        });
-                        console.log(`    ✨ Truly AI-generated: "${trimmedLine.substring(0, 60)}${trimmedLine.length > 60 ? '...' : ''}"`);
-                    }
-                }
-            }
-        }
-        
-        console.log(`\n📊 Found ${trulyAIGeneratedLines.size} truly AI-generated unique lines`);
-
-        // Check ONLY added lines (new code written in this save)
-        if (differences.added.length > 0) {
-            console.log('\n📝 Checking ADDED lines for exact matches:');
-            
-            for (const addedLine of differences.added) {
-                const trimmedFileLine = addedLine.content.trim();
-                
-                // Skip empty lines and LLM_Generated tags
-                if (trimmedFileLine.length === 0 || trimmedFileLine.includes('@LLM_Generated')) {
-                    continue;
-                }
-
-                // Skip if this line existed in the old Git version
-                if (oldLinesFromGit.has(trimmedFileLine)) {
-                    console.log(`  ⏭️  Skipping line ${addedLine.lineNumber}: "${trimmedFileLine.substring(0, 40)}..." (existed in Git)`);
-                    continue;
-                }
-
-                console.log(`  Checking line ${addedLine.lineNumber}: "${trimmedFileLine.substring(0, 50)}${trimmedFileLine.length > 50 ? '...' : ''}"`);
-
-                // Only match if this line is TRULY AI-generated (not from user's context)
-                const aiGenInfo = trulyAIGeneratedLines.get(trimmedFileLine);
-                if (aiGenInfo) {
-                    console.log(`    ✅ TRULY AI-GENERATED LINE FOUND!`);
-                    console.log(`       Content: "${trimmedFileLine.substring(0, 50)}${trimmedFileLine.length > 50 ? '...' : ''}"`);
-                    console.log(`       User prompt: "${aiGenInfo.userPrompt.substring(0, 50)}..."`);
-                    
-                    matches.push({
-                        fileLineNumber: addedLine.lineNumber,
-                        chatbotLine: trimmedFileLine,
-                        fileLineContent: trimmedFileLine,
-                        userPrompt: aiGenInfo.userPrompt,
-                        timestamp: aiGenInfo.timestamp.toISOString(),
-                        modelName: selectedModel
-                    });
-                } else {
-                    // Check if it exists in LLM response but was from user's context
-                    let foundInResponse = false;
-                    for (const msg of recentResponses) {
-                        const chatbotLines = msg.content.split('\n').map((l: string) => l.trim());
-                        if (chatbotLines.includes(trimmedFileLine)) {
-                            foundInResponse = true;
-                            break;
-                        }
-                    }
-                    if (foundInResponse) {
-                        console.log(`    ⏭️  Line exists in LLM response but was from user's context - skipping`);
-                    }
-                }
-            }
-        }
-
-        // Check modified lines (new content only)
-        if (differences.modified.length > 0) {
-            console.log('\n📝 Checking MODIFIED lines (new content only):');
-            
-            for (const modifiedLine of differences.modified) {
-                const trimmedNewContent = modifiedLine.newContent.trim();
-                const trimmedOldContent = modifiedLine.oldContent.trim();
-                
-                // Skip if the line already existed (might be human code)
-                if (trimmedOldContent.length > 0) {
-                    console.log(`  Skipping line ${modifiedLine.lineNumber}: was modified, not new`);
-                    continue;
-                }
-                
-                // Skip empty lines and LLM_Generated tags
-                if (trimmedNewContent.length === 0 || trimmedNewContent.includes('@LLM_Generated')) {
-                    continue;
-                }
-
-                // Skip if this line existed in the old Git version
-                if (oldLinesFromGit.has(trimmedNewContent)) {
-                    console.log(`  ⏭️  Skipping line ${modifiedLine.lineNumber}: "${trimmedNewContent.substring(0, 40)}..." (existed in Git)`);
-                    continue;
-                }
-
-                console.log(`  Checking line ${modifiedLine.lineNumber}: "${trimmedNewContent.substring(0, 50)}${trimmedNewContent.length > 50 ? '...' : ''}"`);
-
-                // Only match if this line is TRULY AI-generated
-                const aiGenInfo = trulyAIGeneratedLines.get(trimmedNewContent);
-                if (aiGenInfo) {
-                    console.log(`    ✅ TRULY AI-GENERATED LINE FOUND!`);
-                    
-                    matches.push({
-                        fileLineNumber: modifiedLine.lineNumber,
-                        chatbotLine: trimmedNewContent,
-                        fileLineContent: trimmedNewContent,
-                        userPrompt: aiGenInfo.userPrompt,
-                        timestamp: aiGenInfo.timestamp.toISOString(),
-                        modelName: selectedModel
-                    });
-                }
-            }
-        }
-
-        const uniqueMatches = this.removeDuplicateMatches(matches);
-
-        console.log(`\n✅ Total exact matches found: ${uniqueMatches.length}`);
-
-        this.documentMatches.set(document.uri.toString(), uniqueMatches);
-
-        if (uniqueMatches.length > 0) {
-            await this.displayMatchResults(uniqueMatches, author, document);
-            
-            // Separate matches into two groups:
-            // 1. Matches belonging to functions that already have tags (for updating)
-            // 2. Matches belonging to functions WITHOUT tags (for adding new tags)
-            
-            const docContent = document.getText();
-            const docLines = docContent.split('\n');
-            
-            // Find which functions already have tags
-            const functionsWithTags = new Set<number>();
-            for (let i = 0; i < docLines.length; i++) {
-                if (docLines[i].includes('@LLM_Generated')) {
-                    // The function is on the next line
-                    functionsWithTags.add(i + 1);
-                    console.log(`  📌 Found existing tag at line ${i + 1}, function at line ${i + 2}`);
-                }
-            }
-            
-            console.log(`\n📋 Functions with existing tags at lines: ${Array.from(functionsWithTags).map(l => l + 1).join(', ')}`);
-            
-            // Separate matches by whether their function has a tag
-            const matchesForUpdate: LineMatch[] = [];
-            const matchesForNewTags: LineMatch[] = [];
-            
-            for (const match of uniqueMatches) {
-                const functionStartLine = this.findFunctionStart(document, match.fileLineNumber - 1);
-                
-                console.log(`  🔍 Line ${match.fileLineNumber} belongs to function at line ${functionStartLine + 1}`);
-                
-                if (functionsWithTags.has(functionStartLine)) {
-                    matchesForUpdate.push(match);
-                    console.log(`    ✅ Function at ${functionStartLine + 1} HAS TAG - will update`);
-                } else {
-                    matchesForNewTags.push(match);
-                    console.log(`    ➕ Function at ${functionStartLine + 1} NO TAG - will add new`);
-                }
-            }
-            
-            console.log(`\n📊 Summary:`);
-            console.log(`  Matches for updating existing tags: ${matchesForUpdate.length}`);
-            console.log(`  Matches for adding new tags: ${matchesForNewTags.length}`);
-            
-            // Update existing tags first
-            if (matchesForUpdate.length > 0) {
-                console.log(`\n🔄 Updating ${matchesForUpdate.length} existing tag(s)...`);
-                await this.updateExistingTags(document, matchesForUpdate);
-            }
-            
-            // Then add new tags
-            if (matchesForNewTags.length > 0) {
-                console.log(`\n➕ Adding ${matchesForNewTags.length} new tag(s)...`);
-                await this.addDecoratorTags(matchesForNewTags, author, document);
-            }
-            
-            if (matchesForUpdate.length === 0 && matchesForNewTags.length === 0) {
-                console.log('\n  ℹ️  No tags to add or update.');
-            }
-        } else {
-            console.log('\n✓ No exact line matches found with chatbot code.');
-        }
+    const stored = this.context.globalState.get<any[]>('conversationHistory');
+    if (stored && stored.length > 0) {
+      return stored;
     }
 
-    /**
-     * Extract code that the user provided as context in their prompt.
-     * This handles various ways users might include code in their messages.
-     */
-    private extractCodeFromPrompt(userPrompt: string): string {
-        let extractedCode = '';
-        
-        // 1. Code blocks with triple backticks (```python ... ``` or ``` ... ```)
-        const codeBlockMatches = userPrompt.matchAll(/```[\w]*\n?([\s\S]*?)```/g);
-        for (const match of codeBlockMatches) {
-            extractedCode += match[1] + '\n';
-        }
-        
-        // 2. Code blocks with single backticks for inline code (less common for multi-line)
-        const inlineCodeMatches = userPrompt.matchAll(/`([^`]+)`/g);
-        for (const match of inlineCodeMatches) {
-            // Only include if it looks like code (contains operators, parentheses, etc.)
-            if (match[1].includes('(') || match[1].includes('=') || match[1].includes(':')) {
-                extractedCode += match[1] + '\n';
-            }
-        }
-        
-        // 3. Indented code (4+ spaces or tabs at start of line)
-        const lines = userPrompt.split('\n');
+    return [];
+  }
+
+  /**
+   * Insert generated authorship tags into changed files.
+   */
+  private async insertAuthorshipTags(repo: any, attributions: any[]): Promise<void> {
+    const tags = this.tagInserter.generateTags(attributions);
+
+    if (tags.length === 0) {
+      console.log('  - No tags generated');
+      return;
+    }
+
+    const tagsByFile = new Map<string, typeof tags>();
+    for (const tag of tags) {
+      const fileTags = tagsByFile.get(tag.codeBlock.filePath) || [];
+      fileTags.push(tag);
+      tagsByFile.set(tag.codeBlock.filePath, fileTags);
+    }
+
+    for (const [relativeFilePath, fileTags] of tagsByFile.entries()) {
+      try {
+        const fileUri = vscode.Uri.joinPath(repo.rootUri, relativeFilePath);
+        const document = await vscode.workspace.openTextDocument(fileUri);
+
+        await this.tagInserter.insertTagsIntoDocument(document, fileTags);
+        await document.save();
+
+        console.log(`  ✓ Inserted ${fileTags.length} tag(s) into ${relativeFilePath}`);
+      } catch (error) {
+        console.error(`  - Failed to insert tags into ${relativeFilePath}:`, error);
+      }
+    }
+  }
+
+  /**
+   * Get all files changed in a commit
+   */
+  private async getCommitFiles(repo: any, commitHash: string): Promise<Array<{filePath: string, status: string}> | null> {
+    const repoPath = repo?.rootUri?.fsPath;
+
+    // Prefer git CLI for consistency across VS Code Git API versions.
+    if (repoPath) {
+      const output = await this.runGitCommand(repoPath, ['show', '--pretty=format:', '--name-status', commitHash]);
+      if (output !== null) {
+        const files: Array<{filePath: string, status: string}> = [];
+        const lines = output.split('\n').map(line => line.trim()).filter(Boolean);
+
         for (const line of lines) {
-            if (line.match(/^(\s{4,}|\t+)\S/)) {
-                extractedCode += line.trim() + '\n';
-            }
+          const parts = line.split(/\s+/);
+          if (parts.length < 2) {
+            continue;
+          }
+
+          const status = parts[0].toUpperCase();
+          const filePath = parts.slice(1).join(' ');
+          files.push({ filePath, status: status[0] });
         }
-        
-        // 4. Lines that look like code (function definitions, class definitions, etc.)
-        const codePatterns = [
-            /^def\s+\w+\s*\(/,           // Python function
-            /^class\s+\w+/,              // Class definition
-            /^function\s+\w+/,           // JS function
-            /^const\s+\w+\s*=/,          // JS const
-            /^let\s+\w+\s*=/,            // JS let
-            /^var\s+\w+\s*=/,            // JS var
-            /^return\s+/,                // Return statement
-            /^\w+\s*=\s*.+/,             // Assignment (but be careful with prose)
-            /^import\s+/,                // Import statement
-            /^from\s+\w+\s+import/,      // Python from import
-            /^async\s+(def|function)/,   // Async function
-            /^await\s+/,                 // Await expression
-            /^if\s*\(.+\)/,              // If statement
-            /^for\s*\(.+\)/,             // For loop
-            /^while\s*\(.+\)/,           // While loop
-            /^try\s*:/,                  // Try block (Python)
-            /^except\s*/,                // Except block (Python)
-            /^else\s*:/,                 // Else block (Python)
-            /^elif\s+/,                  // Elif block (Python)
-        ];
-        
-        for (const line of lines) {
-            const trimmed = line.trim();
-            // Check if line matches code patterns and isn't already extracted
-            if (codePatterns.some(pattern => pattern.test(trimmed))) {
-                if (!extractedCode.includes(trimmed)) {
-                    extractedCode += trimmed + '\n';
-                }
-            }
-        }
-        
-        // 5. Also extract lines that appear after "Current file content:" or similar markers
-        const contextMarkers = [
-            /Current file content:\s*\n([\s\S]*?)(?=\n\n|User Question:|$)/i,
-            /Here'?s? (?:my|the) code:\s*\n([\s\S]*?)(?=\n\n|$)/i,
-            /```[\s\S]*?```/g
-        ];
-        
-        for (const marker of contextMarkers) {
-            const contextMatch = userPrompt.match(marker);
-            if (contextMatch && contextMatch[1]) {
-                extractedCode += contextMatch[1] + '\n';
-            }
-        }
-        
-        const extractedLines = extractedCode.split('\n').filter(l => l.trim()).length;
-        console.log(`    📝 Extracted ${extractedLines} lines of code from user prompt`);
-        
-        return extractedCode;
+
+        return files.length > 0 ? files : null;
+      }
     }
 
-    private async addDecoratorTags(matches: LineMatch[], author: string, document: vscode.TextDocument): Promise<void> {
-        console.log('\n🏷️  Generating decorator tags for functions...');
-        
-        // Group matches by function
-        const functionGroups = await this.groupMatchesByFunction(matches, document);
-        
-        if (functionGroups.length === 0) {
-            console.log('No functions found to tag.');
-            return;
+    try {
+      // Get commit diff to see what files changed
+      const diff = await repo.show(commitHash);
+      const files: Array<{filePath: string, status: string}> = [];
+
+      const lines = diff.split('\n');
+      for (const line of lines) {
+        if (line.startsWith('diff --git')) {
+          // Extract file path from: diff --git a/path/to/file b/path/to/file
+          const match = line.match(/^diff --git a\/(.*) b\/(.*)/);
+          if (match) {
+            const filePath = match[2];
+            files.push({ filePath, status: 'M' }); // Assume modified
+          }
+        } else if (line.startsWith('new file mode')) {
+          // File was added
+          const lastFile = files[files.length - 1];
+          if (lastFile) lastFile.status = 'A';
+        } else if (line.startsWith('deleted file mode')) {
+          // File was deleted
+          const lastFile = files[files.length - 1];
+          if (lastFile) lastFile.status = 'D';
         }
+      }
 
-        console.log(`Found ${functionGroups.length} function(s) with matches`);
+      return files.length > 0 ? files : null;
+    } catch (error) {
+      console.log('[AuthorshipTracker] Could not get commit files:', error);
+      return null;
+    }
+  }
 
-        const docContent = document.getText();
-        const docLines = docContent.split('\n');
-        
-        const functionsToTag: FunctionGroup[] = [];
-        
-        for (const funcGroup of functionGroups) {
-            // Check if the line DIRECTLY above the function has a tag
-            const lineAboveFunction = funcGroup.functionStartLine > 0 ? docLines[funcGroup.functionStartLine - 1] : '';
-            
-            // Only skip if the IMMEDIATE previous line has a tag
-            if (lineAboveFunction.trim().includes('@LLM_Generated')) {
-                console.log(`  ⚠️  Function at line ${funcGroup.functionStartLine + 1} already has a tag. Skipping.`);
-                continue;
-            }
-            
-            functionsToTag.push(funcGroup);
-            console.log(`  ✅ Will tag function at line ${funcGroup.functionStartLine + 1}`);
+  /**
+   * Get file content from a specific commit
+   */
+  private async getFileFromCommit(repo: any, commitHash: string, filePath: string): Promise<string | null> {
+    const repoPath = repo?.rootUri?.fsPath;
+    if (repoPath) {
+      const content = await this.runGitCommand(repoPath, ['show', `${commitHash}:${filePath}`]);
+      if (content !== null) {
+        return content;
+      }
+
+      // Parent commit may not exist on initial commit.
+      if (commitHash.endsWith('^')) {
+        const baseCommit = commitHash.slice(0, -1);
+        const parentCheck = await this.runGitCommand(repoPath, ['rev-parse', '--verify', `${baseCommit}^`]);
+        if (parentCheck === null) {
+          return '';
         }
-
-        if (functionsToTag.length === 0) {
-            console.log('All matching functions already have tags.');
-            return;
-        }
-
-        console.log(`Will add tags to ${functionsToTag.length} function(s)`);
-
-        // Generate decorator tags for each function
-        const decoratorTags: string[] = [];
-        const insertPositions: number[] = [];
-        
-        for (const funcGroup of functionsToTag) {
-            const tag = await this.generateDecoratorTag(funcGroup);
-            decoratorTags.push(tag);
-            insertPositions.push(funcGroup.functionStartLine);
-            
-            console.log(`  📝 Prepared tag for function at line ${funcGroup.functionStartLine + 1}`);
-        }
-
-        // Show confirmation UI before inserting tags
-        await this.showTagConfirmationUI(decoratorTags, insertPositions, document);
-        
-        console.log(`✅ Tag insertion process completed`);
+      }
     }
 
-    private async groupMatchesByFunction(matches: LineMatch[], document: vscode.TextDocument): Promise<FunctionGroup[]> {
-        const functionMap = new Map<number, LineMatch[]>();
+    try {
+      const content = await repo.show(`${commitHash}:${filePath}`);
+      return content;
+    } catch (error) {
+      return null;
+    }
+  }
 
-        // Group matches by their containing function
-        for (const match of matches) {
-            const functionStartLine = this.findFunctionStart(document, match.fileLineNumber - 1);
-            
-            if (!functionMap.has(functionStartLine)) {
-                functionMap.set(functionStartLine, []);
-            }
-            functionMap.get(functionStartLine)!.push(match);
+  /**
+   * Calculate diff between old and new content
+   */
+  private calculateDiff(oldContent: string, newContent: string): string {
+    const oldLines = oldContent.split('\n');
+    const newLines = newContent.split('\n');
+    let diff = '';
+    let oldLineNum = 1;
+    let newLineNum = 1;
+
+    diff += `--- a/file\n`;
+    diff += `+++ b/file\n`;
+    diff += `@@ -1,${oldLines.length} +1,${newLines.length} @@\n`;
+
+    // Simple diff generation (unified format)
+    const maxLines = Math.max(oldLines.length, newLines.length);
+    for (let i = 0; i < maxLines; i++) {
+      const oldLine = oldLines[i] || '';
+      const newLine = newLines[i] || '';
+
+      if (oldLine === newLine) {
+        diff += ` ${oldLine}\n`;
+        oldLineNum++;
+        newLineNum++;
+      } else {
+        if (oldLine) {
+          diff += `-${oldLine}\n`;
+          oldLineNum++;
         }
-
-        // Convert to FunctionGroup array with purpose grouping
-        const functionGroups: FunctionGroup[] = [];
-
-        for (const [functionStartLine, functionMatches] of functionMap) {
-            // Group matches by purpose within this function
-            const purposeMap = new Map<string, number[]>();
-            
-            for (const match of functionMatches) {
-                const purpose = await this.extractPurpose(match.userPrompt);
-                
-                if (!purposeMap.has(purpose)) {
-                    purposeMap.set(purpose, []);
-                }
-                purposeMap.get(purpose)!.push(match.fileLineNumber);
-            }
-
-            functionGroups.push({
-                functionStartLine: functionStartLine,
-                purposeGroups: purposeMap,
-                author: functionMatches[0].userPrompt ? await this.getGitAuthor() : 'Unknown',
-                timestamp: new Date(functionMatches[0].timestamp).toLocaleString(),
-                modelName: functionMatches[0].modelName
-            });
+        if (newLine) {
+          diff += `+${newLine}\n`;
+          newLineNum++;
         }
-
-        return functionGroups;
+      }
     }
 
-    private findFunctionStart(document: vscode.TextDocument, startLine: number): number {
-        const functionKeywords = ['def ', 'function ', 'class ', 'const ', 'let ', 'var ', 'async ', 'public ', 'private ', 'protected ', 'export ', 'static '];
-        
-        for (let i = startLine; i >= Math.max(0, startLine - 30); i--) {
-            const lineText = document.lineAt(i).text.trim();
-            
-            // Skip LLM_Generated tags
-            if (lineText.includes('@LLM_Generated')) {
-                continue;
-            }
-            
-            if (functionKeywords.some(keyword => lineText.includes(keyword) && (lineText.includes('(') || lineText.includes('=')))) {
-                return i;
-            }
-        }
-        
-        return startLine;
+    return diff;
+  }
+
+  /**
+   * Get git extension
+   */
+  private async getGitExtension(): Promise<any> {
+    const gitExtension = vscode.extensions.getExtension('vscode.git');
+    if (!gitExtension) {
+      vscode.window.showErrorMessage('Git extension not found');
+      return null;
     }
 
-    private async extractPurpose(userPrompt: string): Promise<string> {
-        try {
-            const completion = await this.openai.chat.completions.create({
-                model: "openai/gpt-oss-20b:free",
-                messages: [{
-                    role: 'user',
-                    content: `Think carefully and extract the main purpose.\n\nPrompt: "${userPrompt}"\n\nRespond with ONLY 2-3 words (e.g., "subtract function", "error handling", "data validation"):`
-                }],
-                max_tokens: 10,
-                temperature: 0.7
-            });
+    const gitApi = gitExtension.isActive
+      ? gitExtension.exports
+      : await gitExtension.activate();
 
-            const purpose = completion.choices[0].message.content?.trim() || 'code generation';
-            console.log(`  🎯 Extracted purpose: "${purpose}" from prompt: "${userPrompt.substring(0, 50)}..."`);
-            return purpose;
-        } catch (error) {
-            console.error('Error extracting purpose with LLM:', error);
-            return this.extractPurposeManually(userPrompt);
-        }
+    return gitApi.getAPI(1);
+  }
+
+  /**
+   * Get the current git repository
+   */
+  private getGitRepository(git: any): any {
+    if (git.repositories.length === 0) {
+      vscode.window.showErrorMessage('No git repository found');
+      return null;
+    }
+    return git.repositories[0];
+  }
+
+  /**
+   * Get the current commit hash
+   */
+  private async getCurrentCommitHash(repo: any): Promise<string | null> {
+    const headCommit = repo?.state?.HEAD?.commit;
+    if (headCommit) {
+      return headCommit;
     }
 
-    private extractPurposeManually(prompt: string): string {
-        const lowerPrompt = prompt.toLowerCase();
-        
-        if (lowerPrompt.includes('docstring')) return 'add docstring';
-        if (lowerPrompt.includes('comment')) return 'add comments';
-        if (lowerPrompt.includes('subtract')) return 'subtract function';
-        if (lowerPrompt.includes('add')) return 'add function';
-        if (lowerPrompt.includes('multiply')) return 'multiply function';
-        if (lowerPrompt.includes('divide')) return 'divide function';
-        if (lowerPrompt.includes('validate')) return 'data validation';
-        if (lowerPrompt.includes('error')) return 'error handling';
-        if (lowerPrompt.includes('test')) return 'unit testing';
-        if (lowerPrompt.includes('parse')) return 'data parsing';
-        if (lowerPrompt.includes('format')) return 'data formatting';
-        if (lowerPrompt.includes('function')) return 'function creation';
-        if (lowerPrompt.includes('class')) return 'class definition';
-        
-        return 'code generation';
+    try {
+      const commit = await repo.getCommit('HEAD');
+      return commit.hash;
+    } catch (error) {
+      const repoPath = repo?.rootUri?.fsPath;
+      if (repoPath) {
+        const hash = await this.runGitCommand(repoPath, ['rev-parse', 'HEAD']);
+        return hash ? hash.trim() : null;
+      }
+      return null;
     }
+  }
 
-    private async generateDecoratorTag(funcGroup: FunctionGroup): Promise<string> {
-        // Build the decorator tag - consolidate all line numbers and purpose into ONE tag
-        let allLineNumbers: number[] = [];
-        const allPurposes: string[] = [];
-        
-        // Collect all line numbers and purposes
-        for (const [purpose, lineNumbers] of funcGroup.purposeGroups) {
-            allLineNumbers = allLineNumbers.concat(lineNumbers);
-            allPurposes.push(purpose);
-        }
-
-        // Use the most common or first purpose
-        const primaryPurpose = allPurposes[0];
-        
-        // Format all line numbers together
-        const formattedLines = this.formatLineNumbers(allLineNumbers);
-        
-        // Create single consolidated tag
-        const tag = `@LLM_Generated (${funcGroup.modelName} | Author: ${funcGroup.author} | Time: ${funcGroup.timestamp} | Lines: ${formattedLines} | Purpose: ${primaryPurpose})`;
-        
-        return tag;
+  /**
+   * Run a git command in repository root. Returns null when command fails.
+   */
+  private async runGitCommand(repoPath: string, args: string[]): Promise<string | null> {
+    try {
+      const { stdout } = await this.execFileAsync('git', args, { cwd: repoPath });
+      return stdout;
+    } catch {
+      return null;
     }
+  }
 
-    private formatLineNumbers(lineNumbers: number[]): string {
-        if (lineNumbers.length === 0) return '';
-        
-        // Sort line numbers
-        const sorted = [...lineNumbers].sort((a, b) => a - b);
-        
-        // Group consecutive numbers
-        const ranges: string[] = [];
-        let rangeStart = sorted[0];
-        let rangeEnd = sorted[0];
-        
-        for (let i = 1; i <= sorted.length; i++) {
-            if (i < sorted.length && sorted[i] === rangeEnd + 1) {
-                rangeEnd = sorted[i];
-            } else {
-                if (rangeStart === rangeEnd) {
-                    ranges.push(`${rangeStart}`);
-                } else if (rangeEnd === rangeStart + 1) {
-                    ranges.push(`${rangeStart}, ${rangeEnd}`);
-                } else {
-                    ranges.push(`${rangeStart}-${rangeEnd}`);
-                }
-                if (i < sorted.length) {
-                    rangeStart = sorted[i];
-                    rangeEnd = sorted[i];
-                }
-            }
-        }
-        
-        return ranges.join(', ');
-    }
+  /**
+   * Get logs directory
+   */
+  public getLogsDirectory(): string {
+    return this.logger.getLogDir();
+  }
 
-    private async insertDecoratorComments(tags: string[], positions: number[], document: vscode.TextDocument): Promise<void> {
-        const editor = vscode.window.activeTextEditor;
-        
-        if (!editor || editor.document !== document) {
-            console.log('Active editor does not match the document');
-            return;
-        }
+  /**
+   * Update configuration
+   */
+  public setConfig(config: Partial<AuthorshipConfig>): void {
+    this.config = { ...this.config, ...config };
+  }
 
-        console.log(`\n📝 Inserting ${tags.length} decorator comment(s)...`);
-
-        // Sort by position in ASCENDING order (top to bottom)
-        const combined = tags.map((tag, i) => ({ tag, position: positions[i] }));
-        combined.sort((a, b) => a.position - b.position);
-
-        // First, update all tags with their correct line numbers
-        const updatedCombined: Array<{ tag: string, position: number }> = [];
-        let cumulativeShift = 0;
-
-        for (let i = 0; i < combined.length; i++) {
-            const { tag, position } = combined[i];
-            
-            // Each tag adds 1 line
-            const tagLinesCount = 1;
-            
-            // Update line numbers in the tag to reflect:
-            // 1. Cumulative shift from previous tags
-            // 2. +1 for THIS tag being inserted above the function
-            const updatedTag = this.updateLineNumbersInTag(tag, cumulativeShift + tagLinesCount);
-            
-            // Store the updated tag with its adjusted position
-            updatedCombined.push({ 
-                tag: updatedTag, 
-                position: position + cumulativeShift 
-            });
-            
-            console.log(`  Tag ${i + 1}: Shift = ${cumulativeShift}, Position = ${position} -> ${position + cumulativeShift}`);
-            console.log(`  Line numbers in tag shifted by: +${cumulativeShift + tagLinesCount}`);
-            
-            // Increase cumulative shift for next tags
-            cumulativeShift += tagLinesCount;
-        }
-
-        // Now insert the tags in REVERSE order to avoid line number shifts during insertion
-        updatedCombined.reverse();
-
-        await editor.edit(editBuilder => {
-            for (const { tag, position } of updatedCombined) {
-                const line = document.lineAt(position);
-                const indent = line.text.match(/^\s*/)?.[0] || '';
-                
-                const commentPrefix = this.getCommentPrefix(document.languageId);
-                const decoratorComment = `${indent}${commentPrefix} ${tag}\n`;
-                
-                editBuilder.insert(new vscode.Position(position, 0), decoratorComment);
-                
-                console.log(`  📍 Inserted tag at line ${position + 1}`);
-            }
-        });
-
-        console.log(`✅ Successfully applied ${updatedCombined.length} edit(s)`);
-
-        const docUri = document.uri.toString();
-        if (!this.taggedFunctions.has(docUri)) {
-            this.taggedFunctions.set(docUri, new Set());
-        }
-        
-        for (let i = 0; i < positions.length; i++) {
-            this.taggedFunctions.get(docUri)!.add(positions[i]);
-        }
-    }
-
-    private updateLineNumbersInTag(tag: string, lineShift: number): string {
-        // Extract the line numbers section from the tag
-        // Format: @LLM_Generated (...| Lines: 4-6 | ...)
-        
-        const linesMatch = tag.match(/Lines:\s*([0-9,\-\s]+)/);
-        if (!linesMatch) {
-            return tag;
-        }
-        
-        const linesStr = linesMatch[1];
-        const updatedLinesStr = this.shiftLineNumbers(linesStr, lineShift);
-        
-        return tag.replace(/Lines:\s*[0-9,\-\s]+/, `Lines: ${updatedLinesStr}`);
-    }
-
-    private shiftLineNumbers(linesStr: string, shift: number): string {
-        // Parse line numbers like "4-6", "4, 6", "4, 6-8"
-        const parts = linesStr.split(',').map(s => s.trim());
-        const shiftedParts: string[] = [];
-        
-        for (const part of parts) {
-            if (part.includes('-')) {
-                // Range like "4-6"
-                const [start, end] = part.split('-').map(n => parseInt(n.trim()));
-                shiftedParts.push(`${start + shift}-${end + shift}`);
-            } else {
-                // Single number like "4"
-                const num = parseInt(part.trim());
-                shiftedParts.push(`${num + shift}`);
-            }
-        }
-        
-        return shiftedParts.join(', ');
-    }
-
-    private getCommentPrefix(languageId: string): string {
-        const commentMap: { [key: string]: string } = {
-            'python': '#',
-            'javascript': '//',
-            'typescript': '//',
-            'java': '//',
-            'c': '//',
-            'cpp': '//',
-            'csharp': '//',
-            'go': '//',
-            'rust': '//',
-            'php': '//',
-            'ruby': '#',
-            'shell': '#',
-            'bash': '#',
-            'yaml': '#',
-            'toml': '#'
-        };
-        
-        return commentMap[languageId] || '//';
-    }
-
-    private getSelectedModelName(chatbot: any): string {
-        try {
-            const model = chatbot.getSelectedModel?.() || 'openai/gpt-oss-20b:free';
-            return this.getModelDisplayName(model);
-        } catch {
-            return 'GPT OSS 20B';
-        }
-    }
-
-    private getModelDisplayName(modelId: string): string {
-        const modelMap: { [key: string]: string } = {
-            'openai/gpt-oss-20b:free': 'GPT OSS 20B',
-            'meta-llama/llama-3.2-3b-instruct:free': 'Llama 3.2 3B',
-            'mistralai/mistral-7b-instruct:free': 'Mistral 7B'
-        };
-        
-        return modelMap[modelId] || modelId;
-    }
-
-    private findUserPromptForResponse(conversationHistory: any[], assistantIndex: number): string {
-        for (let i = assistantIndex - 1; i >= 0; i--) {
-            if (conversationHistory[i].role === 'user') {
-                let content = conversationHistory[i].content;
-                const userQuestionMatch = content.match(/User Question: (.+)/s);
-                if (userQuestionMatch) {
-                    return userQuestionMatch[1].trim();
-                }
-                return content;
-            }
-        }
-        return 'No user prompt found';
-    }
-
-    private removeDuplicateMatches(matches: LineMatch[]): LineMatch[] {
-        const seen = new Set<number>();
-        return matches.filter(match => {
-            if (seen.has(match.fileLineNumber)) {
-                return false;
-            }
-            seen.add(match.fileLineNumber);
-            return true;
-        });
-    }
-
-    private displayMatchResults(matches: LineMatch[], author: string, document: vscode.TextDocument): void {
-        console.log('\n' + '⚠'.repeat(80));
-        console.log(`🤖 EXACT LINE MATCHES DETECTED: ${matches.length} line(s)`);
-        console.log('⚠'.repeat(80));
-
-        matches.sort((a, b) => a.fileLineNumber - b.fileLineNumber);
-
-        console.log('\n📍 MATCHED LINES:');
-        matches.forEach(match => {
-            console.log(`\n  Line ${match.fileLineNumber} - 100% EXACT MATCH`);
-            console.log(`    Content: "${match.fileLineContent}"`);
-            console.log(`    Author: ${author}`);
-            console.log(`    Model: ${match.modelName}`);
-            console.log(`    Timestamp: ${new Date(match.timestamp).toLocaleString()}`);
-            console.log(`    Purpose: ${match.userPrompt.substring(0, 100)}${match.userPrompt.length > 100 ? '...' : ''}`);
-        });
-
-        console.log('\n' + '-'.repeat(80));
-
-        const lineNumbers = matches.map(m => m.fileLineNumber).join(', ');
-        console.log(`\n✅ SUMMARY: Line(s) ${lineNumbers} are 100% exact matches from AI chatbot`);
-        console.log('⚠'.repeat(80) + '\n');
-
-        vscode.window.showWarningMessage(
-            `🤖 AI-generated: ${matches.length} line(s) matched exactly (Lines: ${lineNumbers})`,
-            'View Details'
-        ).then(selection => {
-            if (selection === 'View Details') {
-                vscode.commands.executeCommand('workbench.action.terminal.focus');
-            }
-        });
-    }
-
-    private async getGitAuthor(): Promise<string> {
-        try {
-            const git = await this.getGitExtension();
-            if (!git) {
-                return 'Unknown';
-            }
-
-            const repo = this.getGitRepository(git);
-            if (!repo) {
-                return 'Unknown';
-            }
-
-            const config = await repo.getConfig('user.name');
-            return config || 'Unknown';
-        } catch (error) {
-            return 'Unknown';
-        }
-    }
-
-    private async getGitExtension(): Promise<any> {
-        const gitExtension = vscode.extensions.getExtension('vscode.git');
-        
-        if (!gitExtension) {
-            vscode.window.showErrorMessage('Git Extension Not Available');
-            return null;
-        }
-
-        const gitApi = gitExtension.isActive 
-            ? gitExtension.exports 
-            : await gitExtension.activate();
-        
-        return gitApi.getAPI(1);
-    }
-
-    private getGitRepository(git: any): any {
-        if (git.repositories.length === 0) {
-            vscode.window.showErrorMessage('No Git Repository Found');
-            return null;
-        }
-
-        return git.repositories[0];
-    }
-
-    private async getLastCommittedVersion(repo: any, document: vscode.TextDocument): Promise<string | null> {
-        try {
-            const relativePath = vscode.workspace.asRelativePath(document.uri, false);
-            const headContent = await repo.show('HEAD', relativePath);
-            return headContent;
-        } catch (error) {
-            vscode.window.showWarningMessage('File Not Found in Git History');
-            return null;
-        }
-    }
-
-    private calculateDetailedDifferences(oldContent: string, newContent: string) {
-        const oldLines = oldContent.split('\n');
-        const newLines = newContent.split('\n');
-
-        const addedLines: Array<{lineNumber: number, content: string}> = [];
-        const removedLines: Array<{lineNumber: number, content: string}> = [];
-        const modifiedLines: Array<{lineNumber: number, oldContent: string, newContent: string}> = [];
-
-        const maxLines = Math.max(oldLines.length, newLines.length);
-        
-        for (let i = 0; i < maxLines; i++) {
-            const oldLine = oldLines[i];
-            const newLine = newLines[i];
-
-            if (oldLine === undefined && newLine !== undefined) {
-                addedLines.push({ lineNumber: i + 1, content: newLine });
-            } else if (oldLine !== undefined && newLine === undefined) {
-                removedLines.push({ lineNumber: i + 1, content: oldLine });
-            } else if (oldLine !== newLine) {
-                modifiedLines.push({
-                    lineNumber: i + 1,
-                    oldContent: oldLine,
-                    newContent: newLine
-                });
-            }
-        }
-
-        const statistics = {
-            totalOldLines: oldLines.length,
-            totalNewLines: newLines.length,
-            linesAdded: addedLines.length,
-            linesRemoved: removedLines.length,
-            linesModified: modifiedLines.length,
-            linesUnchanged: Math.min(oldLines.length, newLines.length) - modifiedLines.length,
-            netLineChange: newLines.length - oldLines.length,
-            charDifference: newContent.length - oldContent.length
-        };
-
-        return {
-            statistics: statistics,
-            added: addedLines,
-            removed: removedLines,
-            modified: modifiedLines,
-            oldContent: oldContent,
-            newContent: newContent
-        };
-    }
-
-    private printDifferencesToConsole(differences: any, document: vscode.TextDocument): void {
-        const fileName = document.fileName.split('/').pop() || document.fileName;
-        
-        console.log('\n' + '='.repeat(80));
-        console.log(`CHANGES IN: ${fileName}`);
-        console.log('='.repeat(80));
-        
-        console.log(`\nLines: ${differences.statistics.totalOldLines} -> ${differences.statistics.totalNewLines} (${differences.statistics.netLineChange >= 0 ? '+' : ''}${differences.statistics.netLineChange})`);
-        console.log(`Added: ${differences.statistics.linesAdded} | Removed: ${differences.statistics.linesRemoved} | Modified: ${differences.statistics.linesModified}`);
-
-        if (differences.added.length > 0) {
-            console.log('\nADDED LINES:');
-            differences.added.forEach((line: any) => {
-                console.log(`  [${line.lineNumber}] + ${line.content}`);
-            });
-        }
-
-        if (differences.removed.length > 0) {
-            console.log('\nREMOVED LINES:');
-            differences.removed.forEach((line: any) => {
-                console.log(`  [${line.lineNumber}] - ${line.content}`);
-            });
-        }
-
-        if (differences.modified.length > 0) {
-            console.log('\nMODIFIED LINES:');
-            differences.modified.forEach((line: any) => {
-                console.log(`  [${line.lineNumber}]`);
-                console.log(`    - ${line.oldContent}`);
-                console.log(`    + ${line.newContent}`);
-            });
-        }
-
-        console.log('\n' + '='.repeat(80) + '\n');
-    }
-
-    // Add this method to track and update existing tags
-    private async updateExistingTags(document: vscode.TextDocument, matches: LineMatch[]): Promise<void> {
-        console.log('\n🔄 Checking for existing tags that need updating...');
-        
-        const editor = vscode.window.activeTextEditor;
-        if (!editor || editor.document !== document) {
-            return;
-        }
-
-        const docContent = document.getText();
-        const docLines = docContent.split('\n');
-        
-        // Find all existing @LLM_Generated tags in the document
-        const existingTags: Array<{ lineNumber: number, content: string }> = [];
-        
-        for (let i = 0; i < docLines.length; i++) {
-            if (docLines[i].includes('@LLM_Generated')) {
-                existingTags.push({ lineNumber: i, content: docLines[i] });
-            }
-        }
-
-        if (existingTags.length === 0) {
-            console.log('  No existing tags found.');
-            return;
-        }
-
-        console.log(`  Found ${existingTags.length} existing tag(s)`);
-
-        // Get the chatbot conversation history to re-scan for AI-generated content
-        const chatbot = ChatbotPanel.getCurrentPanel();
-        if (!chatbot) {
-            console.log('  Cannot update tags - chatbot not available');
-            return;
-        }
-
-        const conversationHistory = chatbot.getConversationHistory();
-
-        // Build the truly AI-generated lines map (same logic as checkExactLineMatches)
-        const trulyAIGeneratedLines = new Set<string>();
-        const recentResponses = conversationHistory
-            .filter((msg: any) => msg.role === 'assistant')
-            .slice(-5); // Check more responses for updating tags
-        
-        for (const msg of recentResponses) {
-            const actualMsgIndex = conversationHistory.indexOf(msg);
-            const userPrompt = this.findUserPromptForResponse(conversationHistory, actualMsgIndex);
-            
-            const userProvidedCode = this.extractCodeFromPrompt(userPrompt);
-            const userProvidedLines = new Set(
-                userProvidedCode
-                    .split('\n')
-                    .map((line: string) => line.trim())
-                    .filter((line: string) => line.length > 0)
-            );
-            
-            const llmResponseLines = msg.content.split('\n');
-            for (const line of llmResponseLines) {
-                const trimmedLine = line.trim();
-                if (trimmedLine.length > 0 && 
-                    !userProvidedLines.has(trimmedLine) &&
-                    !trimmedLine.includes('@LLM_Generated')) {
-                    trulyAIGeneratedLines.add(trimmedLine);
-                }
-            }
-        }
-
-        // Collect all tags that need updating with their new content
-        const tagsToConfirm: Array<{ 
-            oldLine: number, 
-            oldTag: string,
-            newTag: string,
-            functionName: string 
-        }> = [];
-
-        for (const tag of existingTags) {
-            const functionStartLine = tag.lineNumber + 1; // Function is right after the tag
-            
-            console.log(`\n  Processing tag at line ${tag.lineNumber + 1}`);
-            console.log(`    Function should start at line ${functionStartLine + 1}`);
-            
-            // Find the end of this function
-            const functionEndLine = this.findFunctionEnd(document, functionStartLine);
-            console.log(`    Function ends at line ${functionEndLine + 1}`);
-            
-            // Re-scan ALL lines in this function to find which ones are AI-generated
-            const aiGeneratedLines: number[] = [];
-            const processedLines = new Set<number>(); // Track which lines we've already checked
-            
-            for (let lineNum = functionStartLine; lineNum <= functionEndLine; lineNum++) {
-                const currentLine = docLines[lineNum].trim();
-                
-                // Skip empty lines
-                if (currentLine.length === 0) {
-                    continue;
-                }
-                
-                // Skip if we've already processed this line
-                if (processedLines.has(lineNum)) {
-                    continue;
-                }
-                
-                // Only mark as AI-generated if it's in the trulyAIGeneratedLines set
-                if (trulyAIGeneratedLines.has(currentLine)) {
-                    aiGeneratedLines.push(lineNum + 1); // +1 for 1-based line numbers
-                    processedLines.add(lineNum);
-                    console.log(`      ✅ Line ${lineNum + 1} is truly AI-generated: "${currentLine.substring(0, 40)}..."`);
-                }
-            }
-
-            console.log(`    Found ${aiGeneratedLines.length} AI-generated line(s) in this function`);
-
-            if (aiGeneratedLines.length > 0) {
-                console.log(`    AI-generated lines: ${aiGeneratedLines.join(', ')}`);
-                
-                // Extract metadata from existing tag
-                const modelMatch = tag.content.match(/@LLM_Generated \(([^|]+)/);
-                const authorMatch = tag.content.match(/Author:\s*([^|]+)/);
-                const timeMatch = tag.content.match(/Time:\s*([^|]+)/);
-                const purposeMatch = tag.content.match(/Purpose:\s*([^)]+)/);
-                
-                const model = modelMatch ? modelMatch[1].trim() : 'GPT OSS 20B';
-                const author = authorMatch ? authorMatch[1].trim() : 'Unknown';
-                const time = timeMatch ? timeMatch[1].trim() : new Date().toLocaleString();
-                const purpose = purposeMatch ? purposeMatch[1].trim() : 'code generation';
-                
-                // Format the line numbers
-                const formattedLines = this.formatLineNumbers(aiGeneratedLines);
-                
-                // Create updated tag
-                const newTag = `@LLM_Generated (${model} | Author: ${author} | Time: ${time} | Lines: ${formattedLines} | Purpose: ${purpose})`;
-                
-                console.log(`    Old tag: ${tag.content.trim()}`);
-                console.log(`    New tag: ${this.getCommentPrefix(document.languageId)} ${newTag}`);
-                
-                // Check if the tag actually changed
-                const oldTagContent = tag.content.trim();
-                const newTagContent = `${this.getCommentPrefix(document.languageId)} ${newTag}`;
-                
-                if (oldTagContent !== newTagContent) {
-                    // Get function name for display
-                    const functionLine = document.lineAt(functionStartLine).text.trim();
-                    const functionName = this.extractFunctionName(functionLine);
-                    
-                    tagsToConfirm.push({ 
-                        oldLine: tag.lineNumber, 
-                        oldTag: tag.content.trim(),
-                        newTag: newTag,
-                        functionName: functionName
-                    });
-                } else {
-                    console.log(`    Tag is already up-to-date, skipping`);
-                }
-            } else {
-                console.log(`    No AI-generated lines found for this function`);
-            }
-        }
-
-        // Show confirmation UI for each tag update
-        if (tagsToConfirm.length > 0) {
-            console.log(`\n🔔 Showing confirmation UI for ${tagsToConfirm.length} tag update(s)...`);
-            
-            const confirmedUpdates: Array<{ oldLine: number, newTag: string }> = [];
-            
-            for (let i = 0; i < tagsToConfirm.length; i++) {
-                const { oldLine, oldTag, newTag, functionName } = tagsToConfirm[i];
-                
-                console.log(`  Requesting confirmation for tag update at line ${oldLine + 1} (${functionName})`);
-                
-                // Show input box with the NEW tag content (editable)
-                const result = await vscode.window.showInputBox({
-                    prompt: `Review and edit the UPDATED @LLM_Generated tag for function: ${functionName}`,
-                    value: newTag,
-                    placeHolder: 'Edit the updated tag or press Enter to accept',
-                    ignoreFocusOut: true,
-                    validateInput: (value: string) => {
-                        if (!value.trim()) {
-                            return 'Tag cannot be empty';
-                        }
-                        if (!value.includes('@LLM_Generated')) {
-                            return 'Tag must contain @LLM_Generated';
-                        }
-                        return null;
-                    }
-                });
-                
-                if (result === undefined) {
-                    // User cancelled (pressed Escape)
-                    console.log(`  ❌ User cancelled tag update for ${functionName}`);
-                    
-                    const retry = await vscode.window.showWarningMessage(
-                        `Tag update for "${functionName}" was cancelled. What would you like to do?`,
-                        'Skip This Update',
-                        'Retry',
-                        'Keep Old Tag',
-                        'Cancel All'
-                    );
-                    
-                    if (retry === 'Retry') {
-                        i--; // Retry this tag
-                        continue;
-                    } else if (retry === 'Keep Old Tag') {
-                        console.log(`  ⏭️  Keeping old tag for ${functionName}`);
-                        continue; // Don't add to confirmedUpdates, keeping original
-                    } else if (retry === 'Cancel All') {
-                        console.log('  ❌ User cancelled all remaining tag updates');
-                        vscode.window.showInformationMessage('Tag updates cancelled');
-                        return;
-                    } else {
-                        // Skip This Update
-                        console.log(`  ⏭️  Skipped tag update for ${functionName}`);
-                        continue;
-                    }
-                }
-                
-                // User accepted or edited the tag
-                confirmedUpdates.push({ oldLine, newTag: result.trim() });
-                console.log(`  ✅ User accepted/edited tag update for ${functionName}`);
-            }
-            
-            // Apply all confirmed tag updates
-            if (confirmedUpdates.length > 0) {
-                await editor.edit(editBuilder => {
-                    for (const { oldLine, newTag } of confirmedUpdates) {
-                        const line = document.lineAt(oldLine);
-                        const indent = line.text.match(/^\s*/)?.[0] || '';
-                        const commentPrefix = this.getCommentPrefix(document.languageId);
-                        const updatedComment = `${indent}${commentPrefix} ${newTag}`;
-                        
-                        // Replace the entire line
-                        editBuilder.replace(line.range, updatedComment);
-                        
-                        console.log(`  ✅ Updated tag at line ${oldLine + 1}`);
-                    }
-                });
-                
-                console.log(`\n✅ Updated ${confirmedUpdates.length} tag(s)`);
-            } else {
-                console.log('\n  No tags were updated (all cancelled or kept as-is).');
-            }
-        } else {
-            console.log('\n  No tags need updating.');
-        }
-    }
-
-    private findFunctionEnd(document: vscode.TextDocument, functionStartLine: number): number {
-        const docLines = document.getText().split('\n');
-        const functionLine = docLines[functionStartLine];
-        const functionIndent = functionLine.match(/^\s*/)?.[0].length || 0;
-        
-        console.log(`    Finding end of function starting at line ${functionStartLine + 1} (indent: ${functionIndent})`);
-        
-        // Search forward to find where the function ends
-        // Function ends when we hit a line with same or less indentation (that's not empty/comment)
-        for (let i = functionStartLine + 1; i < docLines.length; i++) {
-            const line = docLines[i];
-            const trimmedLine = line.trim();
-            
-            // Skip empty lines and comments
-            if (trimmedLine.length === 0 || trimmedLine.startsWith('#') || trimmedLine.startsWith('//')) {
-                continue;
-            }
-            
-            const lineIndent = line.match(/^\s*/)?.[0].length || 0;
-            
-            // If we hit a line with same or less indentation, function has ended
-            if (lineIndent <= functionIndent) {
-                console.log(`    Function ends at line ${i}`);
-                return i - 1;
-            }
-        }
-        
-        // If we reach end of file, function ends at last line
-        console.log(`    Function ends at end of file (line ${docLines.length})`);
-        return docLines.length - 1;
-    }
-
-    private async showTagConfirmationUI(tags: string[], positions: number[], document: vscode.TextDocument): Promise<void> {
-        console.log(`\n🔔 Showing confirmation UI for ${tags.length} tag(s)...`);
-        
-        // Process each tag one by one
-        for (let i = 0; i < tags.length; i++) {
-            const tag = tags[i];
-            const position = positions[i];
-            
-            // Get the function name for display
-            const functionLine = document.lineAt(position).text.trim();
-            const functionName = this.extractFunctionName(functionLine);
-            
-            console.log(`  Requesting confirmation for tag at line ${position + 1} (${functionName})`);
-            
-            // Show input box with the tag content (editable)
-            const result = await vscode.window.showInputBox({
-                prompt: `Review and edit the @LLM_Generated tag for function: ${functionName}`,
-                value: tag,
-                placeHolder: 'Edit the tag or press Enter to accept',
-                ignoreFocusOut: true,
-                validateInput: (value: string) => {
-                    if (!value.trim()) {
-                        return 'Tag cannot be empty';
-                    }
-                    if (!value.includes('@LLM_Generated')) {
-                        return 'Tag must contain @LLM_Generated';
-                    }
-                    return null;
-                }
-            });
-            
-            if (result === undefined) {
-                // User cancelled (pressed Escape)
-                console.log(`  ❌ User cancelled tag for ${functionName}`);
-                
-                const retry = await vscode.window.showWarningMessage(
-                    `Tag for "${functionName}" was cancelled. What would you like to do?`,
-                    'Skip This Tag',
-                    'Retry',
-                    'Cancel All'
-                );
-                
-                if (retry === 'Retry') {
-                    i--; // Retry this tag
-                    continue;
-                } else if (retry === 'Cancel All') {
-                    console.log('  ❌ User cancelled all remaining tags');
-                    vscode.window.showInformationMessage('Tag insertion cancelled');
-                    return;
-                } else {
-                    // Skip this tag and continue
-                    console.log(`  ⏭️  Skipped tag for ${functionName}`);
-                    continue;
-                }
-            }
-            
-            // User accepted or edited the tag
-            tags[i] = result.trim();
-            console.log(`  ✅ User accepted/edited tag for ${functionName}`);
-        }
-        
-        // Now insert all accepted tags
-        console.log(`\n📝 Inserting ${tags.length} confirmed tag(s)...`);
-        await this.insertDecoratorComments(tags, positions, document);
-    }
-
-    private extractFunctionName(functionLine: string): string {
-        // Python: def function_name(...)
-        const pythonMatch = functionLine.match(/def\s+(\w+)/);
-        if (pythonMatch) {
-            return pythonMatch[1];
-        }
-        
-        // JavaScript/TypeScript: function name(...) or const name = ...
-        const jsMatch = functionLine.match(/(?:function\s+(\w+)|(?:const|let|var)\s+(\w+))/);
-        if (jsMatch) {
-            return jsMatch[1] || jsMatch[2];
-        }
-        
-        // Class: class ClassName
-        const classMatch = functionLine.match(/class\s+(\w+)/);
-        if (classMatch) {
-            return classMatch[1];
-        }
-        
-        return 'Unknown Function';
-    }
+  /**
+   * Get configuration
+   */
+  public getConfig(): AuthorshipConfig {
+    return this.config;
+  }
 }

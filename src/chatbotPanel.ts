@@ -203,10 +203,11 @@ export class ChatbotPanel {
             
             if (selectedText && !selection.isEmpty) {
                 context += `Selected Code:\n\`\`\`${language}\n${selectedText}\n\`\`\`\n`;
-            } else if (fileContent.length < 10000) {
+            } else if (fileContent.length < 4000) {
                 context += `File Content:\n\`\`\`${language}\n${fileContent}\n\`\`\`\n`;
             } else {
-                context += `(File is too large to include entirely)\n`;
+                const truncatedContent = fileContent.substring(0, 4000);
+                context += `File Content (truncated to first 4000 chars):\n\`\`\`${language}\n${truncatedContent}\n\`\`\`\n`;
             }
             
             context += `\nUser Question: ${userMessage}`;
@@ -256,30 +257,73 @@ export class ChatbotPanel {
     }
 
     private async getLLMResponse(prompt: string): Promise<string> {
-        try {
-            // Optional: Limit to last 3 messages to avoid token limits
-            const recentMessages = this.conversationHistory.slice(-3);
-            const messages = recentMessages.map(msg => ({
-                role: msg.role,
-                content: msg.content
-            }));
-            
-            messages.push({
-                role: 'user',
-                content: prompt
-            });
+        // Limit context size to reduce provider throttling risk.
+        const recentMessages = this.conversationHistory.slice(-3);
+        const messages = recentMessages.map(msg => ({
+            role: msg.role,
+            content: msg.content
+        }));
 
-            const completion = await this.openai.chat.completions.create({
-                model: this.selectedModel, // Use the selected model
-                messages: messages
-            });
+        // The user message has already been pushed to conversationHistory by handleUserMessage.
+        // Do not push prompt again here, or the request duplicates tokens.
 
-            return completion.choices[0].message.content || "No response received";
+        const fallbackModels = this.getFallbackModels(this.selectedModel);
+        const maxAttempts = 3;
+        let delayMs = 1000;
+        let modelForAttempt = this.selectedModel;
 
-        } catch (error) {
-            console.error('LLM Error:', error);
-            return `Error: Unable to get response from LLM. ${error}`;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                const completion = await this.openai.chat.completions.create({
+                    model: modelForAttempt,
+                    messages
+                });
+
+                if (modelForAttempt !== this.selectedModel) {
+                    this.selectedModel = modelForAttempt;
+                    this.panel.webview.postMessage({
+                        type: 'modelAutoSwitched',
+                        model: modelForAttempt
+                    });
+                }
+
+                return completion.choices[0].message.content || "No response received";
+            } catch (error: any) {
+                const status = error?.status ?? error?.code;
+                const isRateLimit = status === 429;
+                const isLastAttempt = attempt === maxAttempts;
+
+                if (isRateLimit && !isLastAttempt) {
+                    const fallbackModel = fallbackModels.shift();
+                    if (fallbackModel) {
+                        modelForAttempt = fallbackModel;
+                    }
+                    await new Promise(resolve => setTimeout(resolve, delayMs));
+                    delayMs *= 2;
+                    continue;
+                }
+
+                console.error('LLM Error:', error);
+
+                if (isRateLimit) {
+                    return 'Error: Provider rate limit hit (429). Please wait ~30-60 seconds, disable file context for large files, or switch model/provider and try again.';
+                }
+
+                return `Error: Unable to get response from LLM. ${error}`;
+            }
         }
+
+        return 'Error: Unable to get response from LLM after retries.';
+    }
+
+    private getFallbackModels(primaryModel: string): string[] {
+        const candidates = [
+            'openai/gpt-oss-20b:free',
+            'meta-llama/llama-3.2-3b-instruct:free',
+            'mistralai/mistral-7b-instruct:free'
+        ];
+
+        return candidates.filter(model => model !== primaryModel);
     }
 
     private extractCodeBlocks(text: string): Array<{language: string, code: string}> {
@@ -784,6 +828,12 @@ export class ChatbotPanel {
             modelSelect.value = savedState.selectedModel;
         }
 
+        // Sync backend model with current UI model on load.
+        vscode.postMessage({
+            type: 'modelChanged',
+            model: modelSelect.value
+        });
+
         // Request current file context on load
         vscode.postMessage({ type: 'requestFileContext' });
 
@@ -985,6 +1035,9 @@ export class ChatbotPanel {
                 messagesDiv.innerHTML = '';
             } else if (message.type === 'fileContext') {
                 updateContextDisplay(message.fileInfo);
+            } else if (message.type === 'modelAutoSwitched') {
+                modelSelect.value = message.model;
+                vscode.setState({ selectedModel: modelSelect.value });
             }
         });
     </script>
