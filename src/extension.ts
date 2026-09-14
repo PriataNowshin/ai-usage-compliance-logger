@@ -2,10 +2,10 @@ import * as vscode from 'vscode';
 import { GitChangeTracker } from './gitChangeTracker';
 import { ChatbotPanel } from './chatbotPanel';
 
-export function activate(context: vscode.ExtensionContext) {
+export async function activate(context: vscode.ExtensionContext) {
     // Keep git change tracker as-is
     const gitChangeTracker = new GitChangeTracker(context);
-    gitChangeTracker.activate();
+    await gitChangeTracker.activate();
 
     // Create status bar item for chatbot
     const statusBarItem = vscode.window.createStatusBarItem(
