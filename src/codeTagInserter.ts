@@ -4,7 +4,6 @@
  */
 
 import * as vscode from 'vscode';
-import { createHash } from 'crypto';
 import { AttributionResult, AuthorshipTag } from './types';
 
 export class CodeTagInserter {
@@ -29,22 +28,13 @@ export class CodeTagInserter {
     const language = attribution.codeBlock.language || 'unknown';
     const commentPrefix = this.getCommentPrefix(language);
     const label = attribution.label;
-    const confidence = Math.round(attribution.confidence * 100);
-    const functionHash = this.buildContentHash(attribution.codeBlock.content);
     const lineSummary = this.buildLineWiseSummary(attribution);
 
     // Build tag content
     const tagParts = [
       `@Authorship: ${lineSummary || label}`,
-      `confidence=${confidence}%`,
       `timestamp=${attribution.timestamp.toISOString().split('T')[0]}`,
-      `content_hash=${functionHash}`,
     ];
-
-    if (attribution.firstAppearance) {
-      tagParts.push(`origin=${attribution.firstAppearance.messageRole}`);
-      tagParts.push(`msg_index=${attribution.firstAppearance.messageIndex}`);
-    }
 
     const tagContent = tagParts.join(' | ');
     const fullTag = `${commentPrefix} ${tagContent}`;
@@ -126,14 +116,14 @@ export class CodeTagInserter {
     const line = document.lineAt(lineIndex);
     const indent = this.getLineIndentation(line.text);
     const existingTagLineIndex = this.findExistingTagLineAbove(document, lineIndex);
-    const newHash = this.extractContentHash(tag.tagContent);
 
     if (existingTagLineIndex !== null) {
       const existingLine = document.lineAt(existingTagLineIndex).text;
-      const existingHash = this.extractContentHash(existingLine);
+      const existingSignature = this.getStableTagSignature(existingLine);
+      const newSignature = this.getStableTagSignature(tag.tagContent);
 
-      // Function content unchanged -> keep previous tag.
-      if (existingHash && newHash && existingHash === newHash) {
+      // Unchanged authorship summary/confidence -> keep previous tag.
+      if (existingSignature && newSignature && existingSignature === newSignature) {
         return;
       }
 
@@ -298,7 +288,6 @@ export class CodeTagInserter {
     timestamp?: string;
   } | null {
     const labelMatch = tagLine.match(/\[AUTHORSHIP:\s*(\w+)\]|@Authorship:\s*(\w+)/i);
-    const confidenceMatch = tagLine.match(/confidence=(\d+)%/);
     const originMatch = tagLine.match(/origin=(\w+)/);
     const timestampMatch = tagLine.match(/timestamp=([^\s|]+)/);
 
@@ -308,7 +297,7 @@ export class CodeTagInserter {
 
     return {
       label,
-      confidence: confidenceMatch ? parseInt(confidenceMatch[1]) / 100 : 0.5,
+      confidence: 0,
       origin: originMatch?.[1],
       timestamp: timestampMatch?.[1]
     };
@@ -333,8 +322,7 @@ export class CodeTagInserter {
    * Validate tag format
    */
   public isValidTag(tagLine: string): boolean {
-    return /(\[AUTHORSHIP:\s*(LLM_GENERATED|HUMAN_PROMPT_ORIGIN|HUMAN_WRITTEN|MIXED|UNCERTAIN)\])|(@Authorship:)/i.test(tagLine) &&
-           /confidence=\d+%/.test(tagLine);
+    return /(\[AUTHORSHIP:\s*(LLM_GENERATED|HUMAN_PROMPT_ORIGIN|HUMAN_WRITTEN|MIXED|UNCERTAIN)\])|(@Authorship:)/i.test(tagLine);
   }
 
   /**
@@ -404,18 +392,16 @@ export class CodeTagInserter {
   }
 
   /**
-   * Stable content hash to detect function changes across commits.
+   * Stable tag signature excluding timestamp so idempotent updates still work.
    */
-  private buildContentHash(content: string): string {
-    return createHash('sha1').update(content).digest('hex').slice(0, 12);
-  }
+  private getStableTagSignature(tagLine: string): string | null {
+    const authorshipMatch = tagLine.match(/@Authorship:\s*([^|]+)/i);
 
-  /**
-   * Extract content hash from an existing tag line when present.
-   */
-  private extractContentHash(tagLine: string): string | null {
-    const match = tagLine.match(/content_hash=([a-f0-9]{12,40})/i);
-    return match ? match[1] : null;
+    if (!authorshipMatch) {
+      return null;
+    }
+
+    return authorshipMatch[1].trim();
   }
 
   /**

@@ -121,7 +121,7 @@ export class AuthorshipAttributor {
           lineAttributions,
           evidence: this.buildProvenanceEvidence(codeBlock, firstAppearanceMatch, allMatches),
           reasoning: `Code first appeared in chatbot response (message ${firstAppearanceMatch.messageIndex}). ` +
-                     `Attributed as LLM-generated unless modified by human later.`,
+                     `Attributed to the assistant response unless modified by human later.`,
           firstAppearance: {
             messageIndex: firstAppearanceMatch.messageIndex,
             messageRole: firstAppearanceMatch.messageRole,
@@ -419,7 +419,7 @@ export class AuthorshipAttributor {
 
   /**
    * Detect mixed authorship
-   * When function contains both LLM and human-written portions
+   * When function contains both assistant-response and human-written portions
    */
   public detectMixedAuthorship(
     codeBlock: CodeBlock,

@@ -51,7 +51,42 @@ export class AttributionLogger {
     };
 
     fs.writeFileSync(filepath, JSON.stringify(logData, null, 2), 'utf-8');
+    this.writeLatestViewFiles(logData);
     return filepath;
+  }
+
+  /**
+   * Write stable "latest" files in workspace root for easy viewing in Explorer.
+   */
+  private writeLatestViewFiles(logData: any): void {
+    const latestJsonPath = path.join(process.cwd(), 'AUTHORSHIP_LATEST_LOG.json');
+    fs.writeFileSync(latestJsonPath, JSON.stringify(logData, null, 2), 'utf-8');
+
+    const summaryLines: string[] = [];
+    summaryLines.push('# Latest Authorship Analysis');
+    summaryLines.push('');
+    summaryLines.push(`- Commit: ${logData.metadata.commitHash}`);
+    summaryLines.push(`- Timestamp: ${logData.metadata.timestamp}`);
+    summaryLines.push(`- Files Analyzed: ${logData.metadata.filesAnalyzed.join(', ')}`);
+    summaryLines.push('');
+    summaryLines.push('## Statistics');
+    summaryLines.push('');
+    summaryLines.push(`- Total Blocks: ${logData.metadata.totalCodeBlocks}`);
+    summaryLines.push(`- LLM Generated: ${logData.statistics.llmGeneratedLines}`);
+    summaryLines.push(`- Human Prompt: ${logData.statistics.humanPromptLines}`);
+    summaryLines.push(`- Human Written: ${logData.statistics.humanWrittenLines}`);
+    summaryLines.push(`- Mixed: ${logData.statistics.mixedLines}`);
+    summaryLines.push(`- Uncertain: ${logData.statistics.uncertainLines}`);
+    summaryLines.push('');
+    summaryLines.push('## Per-Function');
+    summaryLines.push('');
+
+    for (const attr of logData.attributions) {
+      summaryLines.push(`- ${attr.filePath} :: ${attr.functionName} :: ${attr.detectedLabel} (${(attr.confidenceScore * 100).toFixed(1)}%)`);
+    }
+
+    const latestMdPath = path.join(process.cwd(), 'AUTHORSHIP_LATEST_REPORT.md');
+    fs.writeFileSync(latestMdPath, summaryLines.join('\n'), 'utf-8');
   }
 
   /**

@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import OpenAI from 'openai';
+import { loadEnvFile } from './envLoader';
 
 interface Message {
     role: 'user' | 'assistant';
@@ -24,9 +25,16 @@ export class ChatbotPanel {
         this.lastActiveEditor = vscode.window.activeTextEditor;
         
         // Initialize OpenAI immediately
+        loadEnvFile(this.context.extensionPath);
+        const apiKey = process.env.OPENROUTER_API_KEY;
+        if (!apiKey) {
+            vscode.window.showErrorMessage(
+                'OPENROUTER_API_KEY is not set. Add it to a .env file in the extension root.'
+            );
+        }
         this.openai = new OpenAI({
             baseURL: "https://openrouter.ai/api/v1",
-            apiKey: "",
+            apiKey: apiKey ?? "",
         });
         
         // Load conversation history from storage FIRST
@@ -1056,8 +1064,8 @@ export class ChatbotPanel {
         }
     }
 
-    public checkAIGeneratedContent(content: string): {
-        isAIGenerated: boolean;
+    public checkAssistantSourcedContent(content: string): {
+        isAssistantSourced: boolean;
         matchedMessages: Array<{
             assistantMessage: string;
             similarity: number;
@@ -1131,7 +1139,7 @@ export class ChatbotPanel {
             : 0;
 
         return {
-            isAIGenerated: uniqueMatches.length > 0 && overallSimilarity > 0.7,
+            isAssistantSourced: uniqueMatches.length > 0 && overallSimilarity > 0.7,
             matchedMessages: uniqueMatches.sort((a, b) => b.similarity - a.similarity),
             overallSimilarity: overallSimilarity
         };
@@ -1306,7 +1314,7 @@ export class ChatbotPanel {
         }
 
         // **NEW: Check if str1 is a subset of str2 (file code ⊆ chatbot code)**
-        // This handles cases where user removed parts of AI-generated code
+        // This handles cases where user removed parts of assistant-sourced code
         if (this.isSubsetMatch(normalized1, normalized2)) {
             return 1.0; // 100% - file code is entirely from chatbot
         }
@@ -1346,7 +1354,7 @@ export class ChatbotPanel {
 
     /**
      * Check if str1 is a subset of str2 by comparing all significant lines
-     * This handles cases where user removed comments/docstrings from AI code
+     * This handles cases where user removed comments/docstrings from assistant-sourced code
      */
     private isSubsetMatch(str1: string, str2: string): boolean {
         // Extract significant lines (ignore comments, docstrings, empty lines)
